@@ -119,4 +119,5 @@ jobs:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INVESTIGATE_REF: ${{ github.event.pull_request.head.sha || github.sha }}
         run: npm run investigate

@@ -57,16 +57,37 @@ function isTerraformSource(path: string): boolean {
   return path.endsWith(".tf") && !path.includes("..");
 }
 
-function buildPrompt(): string {
+function denyMessages(result: PolicyResult): string[] {
+  if (!Array.isArray(result.deny)) {
+    return [];
+  }
+  return result.deny.filter((item): item is string => typeof item === "string");
+}
+
+function buildPrompt(denies: string[], useCloud: boolean): string {
+  const context = useCloud
+    ? [
+        "The policy denial messages are:",
+        ...denies.map((message) => `- ${message}`),
+        "",
+        "The generated plan artifacts are not in this clone. Inspect the Terraform configuration and AGENTS.md.",
+        "Modify only Terraform .tf source files. Do not edit policy, workflows, docs, or scripts.",
+        "A remediation pull request will be created from your .tf changes.",
+      ]
+    : [
+        "Start from artifacts/policy-result.json and artifacts/plan.json.",
+        "You may also inspect AGENTS.md, main.tf, modules/, policies/, scripts/, and any other file inside this repository that you need.",
+        "Do not commit, push, create a branch, or open a pull request. Orchestration will do that after you finish.",
+      ];
+
   return [
     "A Terraform policy check failed.",
     "",
-    "Investigate the denial using only the repository and generated Terraform plan artifacts.",
+    "Investigate the denial using the repository and the policy failure.",
     "",
     "Follow AGENTS.md.",
     "",
-    "Start from artifacts/policy-result.json and artifacts/plan.json.",
-    "You may also inspect AGENTS.md, main.tf, modules/, policies/, scripts/, and any other file inside this repository that you need.",
+    ...context,
     "",
     "Determine the root cause and make the smallest compliant code remediation.",
     "",
@@ -74,7 +95,6 @@ function buildPrompt(): string {
     "Do not assume the fix belongs in the resource, reusable module, or caller.",
     "Do not run ./scripts/verify.sh. Local checks are not the authoritative result.",
     "You may run terraform fmt on files you change.",
-    "Do not commit, push, create a branch, or open a pull request. Orchestration will do that after you finish.",
     "",
     "When you are done, return a concise remediation summary using only these headings:",
     "",
@@ -191,19 +211,47 @@ async function main(): Promise<void> {
     throw new Error("artifacts/plan.json is missing");
   }
 
+  const useCloud = process.env.GITHUB_ACTIONS === "true";
+  const denies = denyMessages(policyResult);
+  const prompt = buildPrompt(denies, useCloud);
+
   let result;
   try {
-    const store = new JsonlLocalAgentStore(
-      mkdtempSync(join(tmpdir(), "cursor-agent-"))
-    );
-    result = await Agent.prompt(buildPrompt(), {
-      apiKey: process.env.CURSOR_API_KEY,
-      model: { id: "composer-2.5" },
-      local: {
-        cwd: repoRoot,
-        store,
-      },
-    });
+    if (useCloud) {
+      const repo = process.env.GITHUB_REPOSITORY;
+      const server = process.env.GITHUB_SERVER_URL ?? "https://github.com";
+      const startingRef =
+        process.env.INVESTIGATE_REF || process.env.GITHUB_SHA;
+      if (!repo || !startingRef) {
+        throw new Error("GITHUB_REPOSITORY and INVESTIGATE_REF are required in CI");
+      }
+      result = await Agent.prompt(prompt, {
+        apiKey: process.env.CURSOR_API_KEY,
+        model: { id: "composer-2.5" },
+        cloud: {
+          repos: [
+            {
+              url: `${server}/${repo}`,
+              startingRef,
+            },
+          ],
+          autoCreatePR: true,
+          skipReviewerRequest: true,
+        },
+      });
+    } else {
+      const store = new JsonlLocalAgentStore(
+        mkdtempSync(join(tmpdir(), "cursor-agent-"))
+      );
+      result = await Agent.prompt(prompt, {
+        apiKey: process.env.CURSOR_API_KEY,
+        model: { id: "composer-2.5" },
+        local: {
+          cwd: repoRoot,
+          store,
+        },
+      });
+    }
   } catch (error) {
     if (error instanceof CursorAgentError) {
       console.error(
@@ -229,6 +277,20 @@ async function main(): Promise<void> {
   if (result.status !== "finished") {
     console.error(`run did not finish: ${result.status}`);
     process.exitCode = 2;
+    return;
+  }
+
+  if (useCloud) {
+    const prUrls =
+      result.git?.branches
+        ?.map((branch) => branch.prUrl)
+        .filter((url): url is string => Boolean(url)) ?? [];
+    if (prUrls.length === 0) {
+      throw new Error("cloud investigator finished without a pull request URL");
+    }
+    for (const url of prUrls) {
+      console.log(`remediation PR: ${url}`);
+    }
     return;
   }
 
