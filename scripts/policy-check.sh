@@ -8,35 +8,24 @@ if [[ ! -f artifacts/plan.json ]]; then
   exit 1
 fi
 
-opa eval --format json -i artifacts/plan.json -d policies/ 'data.terraform.deny' \
-  | python3 -c '
-import json
-import sys
+opa eval --format pretty \
+  -i artifacts/plan.json \
+  -d policies/ \
+  '{"deny": data.terraform.deny, "pass": count(data.terraform.deny) == 0}' \
+  > artifacts/policy-result.json
 
-try:
-    raw = json.load(sys.stdin)
-except json.JSONDecodeError as exc:
-    print(f"error: failed to parse opa eval JSON: {exc}", file=sys.stderr)
-    sys.exit(1)
+pass="$(opa eval --format raw -i artifacts/plan.json -d policies/ 'count(data.terraform.deny) == 0')"
 
-messages = []
-result = raw.get("result") if isinstance(raw, dict) else None
-if isinstance(result, list) and result and isinstance(result[0], dict):
-    expressions = result[0].get("expressions")
-    if isinstance(expressions, list) and expressions and isinstance(expressions[0], dict):
-        value = expressions[0].get("value", [])
-        if isinstance(value, list):
-            messages = [item if isinstance(item, str) else str(item) for item in value]
+if [[ "${pass}" == "true" ]]; then
+  echo "OPA policy PASS"
+  exit 0
+fi
 
-out = {"deny": messages, "pass": len(messages) == 0}
-with open("artifacts/policy-result.json", "w", encoding="utf-8") as fh:
-    json.dump(out, fh)
-    fh.write("\n")
+opa eval --format raw -i artifacts/plan.json -d policies/ 'data.terraform.deny[_]' |
+  while IFS= read -r line; do
+    msg="${line#\"}"
+    msg="${msg%\"}"
+    printf 'DENY: %s\n' "${msg}"
+  done
 
-if messages:
-    for msg in messages:
-        print(f"DENY: {msg}")
-    sys.exit(1)
-
-print("OPA policy PASS")
-'
+exit 1

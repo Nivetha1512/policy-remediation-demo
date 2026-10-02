@@ -6,9 +6,15 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   policy-check:
     runs-on: ubuntu-latest
+    outputs:
+      opa_denied: ${{ steps.opa.outputs.denied }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,5 +33,90 @@ jobs:
           sudo mv opa /usr/local/bin/opa
           opa version
 
-      - name: Verify Terraform and OPA policy
-        run: ./scripts/verify.sh
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        run: ./scripts/plan.sh
+
+      - name: OPA policy check
+        id: opa
+        run: |
+          set +e
+          ./scripts/policy-check.sh
+          status=$?
+          set -e
+
+          if [[ ! -f artifacts/policy-result.json ]]; then
+            echo "denied=false" >> "${GITHUB_OUTPUT}"
+            echo "policy-check did not write artifacts/policy-result.json"
+            exit 1
+          fi
+
+          if jq -e '.pass == true and (.deny | length) == 0' artifacts/policy-result.json >/dev/null; then
+            echo "denied=false" >> "${GITHUB_OUTPUT}"
+            echo "OPA policy PASS"
+            exit 0
+          fi
+
+          if jq -e '.pass == false and (.deny | length) > 0' artifacts/policy-result.json >/dev/null; then
+            echo "denied=true" >> "${GITHUB_OUTPUT}"
+            echo "OPA policy denial captured"
+            exit 1
+          fi
+
+          echo "denied=false" >> "${GITHUB_OUTPUT}"
+          echo "policy-check failed without a policy denial"
+          exit 1
+
+      - name: Upload plan and policy artifacts
+        if: failure() && steps.opa.outputs.denied == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: policy-artifacts
+          path: |
+            artifacts/plan.json
+            artifacts/policy-result.json
+
+  investigate:
+    needs: policy-check
+    if: |
+      always()
+      && needs.policy-check.result == 'failure'
+      && needs.policy-check.outputs.opa_denied == 'true'
+      && !startsWith(github.head_ref || github.ref_name, 'policy-remediation/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout failing ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Download plan and policy artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: policy-artifacts
+          path: artifacts
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.13"
+          cache: npm
+
+      - name: Install investigator dependencies
+        run: npm ci
+
+      - name: Invoke Cursor SDK investigator
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run investigate

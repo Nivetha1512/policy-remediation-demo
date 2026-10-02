@@ -55,9 +55,32 @@ Tell Cursor to follow `AGENTS.md`, investigate the policy failure, and produce t
 
 ## GitHub Actions policy gate
 
-The `policy-check` workflow runs `./scripts/verify.sh` on every push to `main` and every pull request. It installs Terraform 1.9.0 and OPA 1.21.1. It does not apply infrastructure and does not use AWS credentials.
+The `policy-check` job runs Terraform fmt, validate, and plan, then evaluates the same OPA policy. It does not apply infrastructure and does not use AWS credentials.
 
-A red check on the broken caller is expected. That is the policy engine denying the plan. After a compliant HCL change, the same workflow should pass. `./scripts/reset-demo.sh` returns the demo to a failing gate.
+A red `policy-check` on the broken caller is expected. That is the policy engine denying the plan.
+
+If and only if OPA returns a denial, the `investigate` job starts a Cursor SDK investigator against the checked-out repository. Formatting, validation, plan, and dependency failures do not start the investigator. Branches named `policy-remediation/*` also skip it so a remediation pull request is verified by OPA, not investigated again.
+
+The investigator edits code only. Orchestration then opens a new remediation branch and pull request. That pull request runs this same workflow. The green OPA check on the remediation pull request is the authoritative result. The investigator does not claim success itself.
+
+### Required GitHub secret
+
+| Secret | Purpose |
+| --- | --- |
+| `CURSOR_API_KEY` | Cursor user or service-account API key for `@cursor/sdk` |
+
+Create the key at [Cursor Dashboard → Integrations](https://cursor.com/dashboard/integrations) or in team service-account settings. Add it as a repository secret named `CURSOR_API_KEY`. Do not commit the value.
+
+GitHub's `GITHUB_TOKEN` is used to push the remediation branch and open the pull request.
+
+### Demo sequence
+
+1. Keep the original caller in the broken state, or run `./scripts/reset-demo.sh`.
+2. Push to `main` or open a pull request.
+3. Watch `policy-check` fail on the OPA denial.
+4. If `CURSOR_API_KEY` is set, `investigate` opens a `policy-remediation/*` pull request.
+5. The remediation pull request reruns fmt, validate, plan, and OPA.
+6. A green OPA check on that pull request is success.
 
 ## A weaker approach
 

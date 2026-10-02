@@ -13,7 +13,7 @@ Investigate a Terraform policy denial and produce the smallest compliant remedia
 - Prefer the smallest compliant change.
 - Do not assume the fix belongs in the resource, the reusable module, or the caller.
 - Do not change reusable module defaults unless that is clearly the intended scope.
-- After editing, format, validate, regenerate the plan, and re-run the same policy via `./scripts/verify.sh`.
+- After editing, you may run `terraform fmt` on files you change. Do not treat local checks as final verification. The GitHub Actions policy gate on the remediation pull request is authoritative.
 - If no compliant code remediation exists, stop and report that an exception or human decision is required.
 
 ## Remediation report
