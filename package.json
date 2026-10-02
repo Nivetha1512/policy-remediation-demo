@@ -1,0 +1,19 @@
+{
+  "name": "policy-failure-investigator",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "investigate": "tsx agent/investigator.ts"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.35"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
