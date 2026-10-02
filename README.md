@@ -59,7 +59,7 @@ The `policy-check` job runs Terraform fmt, validate, and plan, then evaluates th
 
 A red `policy-check` on the broken caller is expected. That is the policy engine denying the plan.
 
-If and only if OPA returns a denial, the `investigate` job starts a Cursor SDK investigator against the checked-out repository. Formatting, validation, plan, and dependency failures do not start the investigator. Branches named `policy-remediation/*` also skip it so a remediation pull request is verified by OPA, not investigated again.
+If and only if OPA returns a denial, the `investigate` job starts a Cursor SDK cloud investigator against this GitHub repository. Local SDK execution on GitHub Actions crashed (exit 139), so CI does not load the local native agent. Formatting, validation, plan, and dependency failures do not start the investigator. Branches named `policy-remediation/*` also skip it so a remediation pull request is verified by OPA, not investigated again.
 
 The investigator edits code only. Orchestration then opens a new remediation branch and pull request. That pull request runs this same workflow. The green OPA check on the remediation pull request is the authoritative result. The investigator does not claim success itself.
 
