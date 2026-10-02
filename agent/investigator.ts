@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Agent, CursorAgentError } from "@cursor/sdk";
+import { Agent, CursorAgentError, JsonlLocalAgentStore } from "@cursor/sdk";
 
 const repoRoot = process.cwd();
 
@@ -192,10 +193,16 @@ async function main(): Promise<void> {
 
   let result;
   try {
+    const store = new JsonlLocalAgentStore(
+      mkdtempSync(join(tmpdir(), "cursor-agent-"))
+    );
     result = await Agent.prompt(buildPrompt(), {
       apiKey: process.env.CURSOR_API_KEY,
       model: { id: "composer-2.5" },
-      local: { cwd: repoRoot },
+      local: {
+        cwd: repoRoot,
+        store,
+      },
     });
   } catch (error) {
     if (error instanceof CursorAgentError) {
