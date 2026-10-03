@@ -122,9 +122,8 @@ function buildPrompt(denies: string[]): string {
     "Determine whether a safe compliant code remediation can be made using only the repository and available plan/policy context.",
     "",
     "If yes:",
-    "- make the smallest compliant change",
+    "- apply the smallest compliant Terraform .tf source change in this workspace",
     "- minimize blast radius",
-    "- modify only Terraform .tf source files",
     "- do not modify policy",
     '- return outcome="remediation"',
     "",
@@ -133,8 +132,9 @@ function buildPrompt(denies: string[]): string {
     '- return outcome="no_code_fix"',
     "- explain what information, exception, ownership decision, or external dependency is required",
     "",
-    "Do not commit, push, create branches, create pull requests, create issues, or post GitHub comments.",
-    "Orchestration handles all GitHub mechanics.",
+    "Do not create pull requests, issues, or GitHub comments.",
+    "Do not push to the developer branch or to main.",
+    "Orchestration handles all GitHub mechanics after you finish.",
     "",
     "Return only one JSON object, with no Markdown fence or other text, matching exactly one of these shapes:",
     "",
@@ -509,6 +509,56 @@ function createNoCodeFixIssue(
   console.log(`follow-up issue: ${issueUrl}`);
 }
 
+function extractCloudBranches(
+  git:
+    | {
+        branches?: Array<{ branch?: string; prUrl?: string }>;
+      }
+    | undefined,
+): CloudBranch[] {
+  return (
+    git?.branches
+      ?.filter(
+        (branch): branch is typeof branch & { branch: string } =>
+          typeof branch.branch === "string" && branch.branch !== "",
+      )
+      .map((branch) => ({ branch: branch.branch, prUrl: branch.prUrl })) ?? []
+  );
+}
+
+async function waitForCloudBranches(
+  resultGit:
+    | {
+        branches?: Array<{ branch?: string; prUrl?: string }>;
+      }
+    | undefined,
+  runId: string,
+  agentId: string,
+): Promise<CloudBranch[]> {
+  const immediate = extractCloudBranches(resultGit);
+  if (immediate.length > 0) {
+    return immediate;
+  }
+
+  for (let attempt = 1; attempt <= 12; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    const run = await Agent.getRun(runId, {
+      runtime: "cloud",
+      agentId,
+      apiKey: process.env.CURSOR_API_KEY,
+    });
+    const branches = extractCloudBranches(run.git);
+    console.log(
+      `cloud git poll ${attempt}: ${JSON.stringify(run.git ?? null)}`,
+    );
+    if (branches.length > 0) {
+      return branches;
+    }
+  }
+
+  return [];
+}
+
 function hideGithubCredentials(): () => void {
   const saved = {
     GH_TOKEN: process.env.GH_TOKEN,
@@ -558,11 +608,12 @@ async function main(): Promise<void> {
   const prompt = buildPrompt(denies);
 
   let result;
+  let agentId = "";
   const restoreGithubCredentials = hideGithubCredentials();
   try {
     const repository = process.env.GITHUB_REPOSITORY!;
     const server = process.env.GITHUB_SERVER_URL ?? "https://github.com";
-    result = await Agent.prompt(prompt, {
+    await using agent = await Agent.create({
       apiKey: process.env.CURSOR_API_KEY,
       model: { id: "composer-2.5" },
       cloud: {
@@ -572,10 +623,16 @@ async function main(): Promise<void> {
             startingRef: context.headSha,
           },
         ],
+        workOnCurrentBranch: false,
         autoCreatePR: true,
         skipReviewerRequest: true,
       },
     });
+    agentId = agent.agentId;
+    console.log(`agent.id=${agentId}`);
+    const run = await agent.send(prompt);
+    console.log(`run.id=${run.id}`);
+    result = await run.wait();
   } catch (error) {
     if (error instanceof CursorAgentError) {
       console.error(
@@ -590,6 +647,7 @@ async function main(): Promise<void> {
   }
 
   console.log(`run.id=${result.id} status=${result.status}`);
+  console.log(`run.git=${JSON.stringify(result.git ?? null)}`);
 
   if (result.status === "error") {
     console.error(`run failed: ${result.id}`);
@@ -622,13 +680,11 @@ async function main(): Promise<void> {
   }
 
   const outcome = parseOutcome(result.result ?? "");
-  const cloudBranches =
-    result.git?.branches
-      .filter(
-        (branch): branch is typeof branch & { branch: string } =>
-          typeof branch.branch === "string" && branch.branch !== "",
-      )
-      .map((branch) => ({ branch: branch.branch, prUrl: branch.prUrl })) ?? [];
+  const cloudBranches = await waitForCloudBranches(
+    result.git,
+    result.id,
+    agentId,
+  );
   console.log(JSON.stringify(outcome, null, 2));
   if (outcome.outcome === "remediation") {
     if (cloudBranches.length !== 1) {
