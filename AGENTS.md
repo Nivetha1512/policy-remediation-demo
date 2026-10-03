@@ -14,20 +14,25 @@ Investigate a Terraform policy denial and produce the smallest compliant remedia
 - Do not assume the fix belongs in the resource, the reusable module, or the caller.
 - Do not change reusable module defaults unless that is clearly the intended scope.
 - After editing, you may run `terraform fmt` on files you change. Do not treat local checks as final verification. The GitHub Actions policy gate on the remediation pull request is authoritative.
-- If no compliant code remediation exists, stop and report that an exception or human decision is required.
+- If no safe compliant code remediation can be justified from repository and policy context, do not edit source files. Report what information, exception, ownership decision, or external dependency is required.
+- Never commit, push, create or switch branches, create pull requests or issues, or post GitHub comments. Deterministic orchestration handles Git and GitHub operations.
 
-## Remediation report
+## Investigation result
 
-Fill this report from the investigation. Use only these headings.
+Return exactly one machine-readable outcome:
 
-### Violation
+- `remediation` when a safe compliant code change was made.
+- `no_code_fix` when a safe code change cannot be justified.
 
-### Root cause
+## Branch naming
 
-### Files examined
+Demo violation branches:
 
-### Remediation
+- `demo/encryption-failure`
+- `demo/kms-failure`
 
-### Why this location
+Agent-generated remediation branches:
 
-### Verification
+- `policy-remediation/<short-description-or-run-id>`
+
+Do not create ad hoc `cursor/*` or `fix/*` branches for the demo workflow.
