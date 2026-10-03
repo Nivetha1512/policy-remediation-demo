@@ -1,9 +1,8 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { Agent, CursorAgentError, JsonlLocalAgentStore } from "@cursor/sdk";
+import { Agent, CursorAgentError } from "@cursor/sdk";
 
 const repoRoot = process.cwd();
 
@@ -113,7 +112,7 @@ function buildPrompt(denies: string[]): string {
     "",
     "Follow AGENTS.md.",
     "",
-    "Start from artifacts/policy-result.json and artifacts/plan.json. Inspect any repository files needed for the investigation.",
+    "Use the denial messages above as the plan/policy result context. Inspect any repository files needed for the investigation.",
     "",
     "Determine whether a safe compliant code remediation can be made using only the repository and available plan/policy context.",
     "",
@@ -297,8 +296,31 @@ function buildPrBody(outcome: RemediationOutcome): string {
   ].join("\n");
 }
 
-function verifyRemediationChanges(): string[] {
-  const paths = changedPaths();
+function remoteChangedPaths(base: string, target: string): string[] {
+  const output = runGit([
+    "diff",
+    "--no-renames",
+    "--name-only",
+    "-z",
+    base,
+    target,
+    "--",
+  ]);
+  return output.split("\0").filter(Boolean).sort();
+}
+
+function fetchCloudBranch(branch: string): string {
+  runGit(["check-ref-format", `refs/heads/${branch}`]);
+  runGit([
+    "fetch",
+    "origin",
+    `+refs/heads/${branch}:refs/remotes/origin/${branch}`,
+  ]);
+  return runGit(["rev-parse", `refs/remotes/origin/${branch}`]);
+}
+
+function verifyRemediationChanges(base: string, target: string): string[] {
+  const paths = remoteChangedPaths(base, target);
   if (paths.length === 0) {
     throw new Error("investigator produced no Terraform remediation");
   }
@@ -307,6 +329,14 @@ function verifyRemediationChanges(): string[] {
   if (blocked.length > 0) {
     throw new Error(
       `investigator changed blocked files; refusing remediation PR: ${blocked.join(", ")}`,
+    );
+  }
+  const symlinks = paths.filter((path) =>
+    runGit(["ls-tree", target, "--", path]).startsWith("120000 "),
+  );
+  if (symlinks.length > 0) {
+    throw new Error(
+      `investigator created symbolic links; refusing remediation PR: ${symlinks.join(", ")}`,
     );
   }
   return paths;
@@ -326,8 +356,8 @@ function remediationBranchName(): string {
 function createRemediationPr(
   outcome: RemediationOutcome,
   context: PullRequestContext,
+  cloudBranch: string,
 ): void {
-  const remediations = verifyRemediationChanges();
   const branchB = remediationBranchName();
 
   runGh(["auth", "setup-git"]);
@@ -345,24 +375,19 @@ function createRemediationPr(
     );
   }
 
-  runGit(["checkout", "-b", branchB, context.headSha]);
-  runGit(["add", "--", ...remediations]);
-  execFileSync(
-    "git",
-    [
-      "-c",
-      "user.name=github-actions[bot]",
-      "-c",
-      "user.email=41898282+github-actions[bot]@users.noreply.github.com",
-      "commit",
-      "-m",
-      "Remediate Terraform policy denial",
-      "--",
-      ...remediations,
-    ],
-    { cwd: repoRoot, stdio: "inherit", env: process.env },
-  );
+  const cloudCommit = fetchCloudBranch(cloudBranch);
+  if (
+    runGit(["merge-base", context.headSha, cloudCommit]) !== context.headSha
+  ) {
+    throw new Error(
+      "investigator branch is not based on the pull request head",
+    );
+  }
+  verifyRemediationChanges(context.headSha, cloudCommit);
+
+  runGit(["branch", branchB, cloudCommit]);
   runGit(["push", "-u", "origin", branchB]);
+  runGit(["push", "origin", "--delete", cloudBranch]);
 
   const prUrl = runGh([
     "pr",
@@ -384,12 +409,24 @@ function createRemediationPr(
 function createNoCodeFixIssue(
   outcome: NoCodeFixOutcome,
   context: PullRequestContext,
+  cloudBranches: string[],
 ): void {
   const paths = changedPaths();
   if (paths.length > 0) {
     throw new Error(
       `no_code_fix outcome changed files; refusing issue creation: ${paths.join(", ")}`,
     );
+  }
+  runGh(["auth", "setup-git"]);
+  for (const branch of cloudBranches) {
+    const cloudCommit = fetchCloudBranch(branch);
+    const remotePaths = remoteChangedPaths(context.headSha, cloudCommit);
+    if (remotePaths.length > 0) {
+      throw new Error(
+        `no_code_fix outcome changed files on ${branch}; refusing issue creation: ${remotePaths.join(", ")}`,
+      );
+    }
+    runGit(["push", "origin", "--delete", branch]);
   }
 
   const issueBody = [
@@ -500,15 +537,20 @@ async function main(): Promise<void> {
   let result;
   const restoreGithubCredentials = hideGithubCredentials();
   try {
-    const store = new JsonlLocalAgentStore(
-      mkdtempSync(join(tmpdir(), "cursor-agent-")),
-    );
+    const repository = process.env.GITHUB_REPOSITORY!;
+    const server = process.env.GITHUB_SERVER_URL ?? "https://github.com";
     result = await Agent.prompt(prompt, {
       apiKey: process.env.CURSOR_API_KEY,
       model: { id: "composer-2.5" },
-      local: {
-        cwd: repoRoot,
-        store,
+      cloud: {
+        repos: [
+          {
+            url: `${server}/${repository}`,
+            startingRef: context.headSha,
+          },
+        ],
+        autoCreatePR: false,
+        skipReviewerRequest: true,
       },
     });
   } catch (error) {
@@ -557,11 +599,20 @@ async function main(): Promise<void> {
   }
 
   const outcome = parseOutcome(result.result ?? "");
+  const cloudBranches =
+    result.git?.branches
+      .map((branch) => branch.branch)
+      .filter((branch): branch is string => Boolean(branch)) ?? [];
   console.log(JSON.stringify(outcome, null, 2));
   if (outcome.outcome === "remediation") {
-    createRemediationPr(outcome, context);
+    if (cloudBranches.length !== 1) {
+      throw new Error(
+        `remediation outcome requires exactly one investigator branch; found ${cloudBranches.length}`,
+      );
+    }
+    createRemediationPr(outcome, context, cloudBranches[0]);
   } else {
-    createNoCodeFixIssue(outcome, context);
+    createNoCodeFixIssue(outcome, context, cloudBranches);
   }
 }
 

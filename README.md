@@ -58,9 +58,9 @@ The `policy-check` job runs Terraform fmt, validate, and plan, then evaluates th
 
 A red `policy-check` on the broken caller is expected. That is the policy engine denying the plan.
 
-If and only if OPA returns a denial on an in-repository pull request, the `investigate` job starts a local Cursor SDK investigator against the checked-out pull-request head. Formatting, validation, plan, and dependency failures do not start the investigator. Branches named `policy-remediation/*` skip investigation so a remediation pull request is verified by OPA without recursively launching another investigator.
+If and only if OPA returns a denial on an in-repository pull request, the `investigate` job starts a Cursor SDK cloud investigator from the pull-request head. Formatting, validation, plan, and dependency failures do not start the investigator. Branches named `policy-remediation/*` skip investigation so a remediation pull request is verified by OPA without recursively launching another investigator.
 
-The agent has no GitHub token while it runs and is instructed to edit code only. TypeScript validates its structured response and working-tree changes before restoring credentials for deterministic GitHub orchestration.
+The agent has no workflow GitHub token and is instructed to edit code only. It does not create a pull request. TypeScript validates its structured response and remote diff, creates the canonical `policy-remediation/*` ref, removes the temporary cloud branch, and performs deterministic GitHub orchestration.
 
 For a `remediation` outcome, orchestration accepts only changed `.tf` files, creates `policy-remediation/<run-id>-<attempt>`, commits those files, pushes the branch, and opens a pull request whose base is the developer branch from `github.event.pull_request.head.ref`. It never targets `main` directly and never auto-merges. The green OPA check after a human merges the remediation pull request into the developer branch is authoritative for the original pull request. Demo workflow branches use only `demo/encryption-failure`, `demo/kms-failure`, and `policy-remediation/*`; ad hoc `cursor/*` and `fix/*` branch names are not used.
 
