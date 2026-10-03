@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Agent, CursorAgentError } from "@cursor/sdk";
+import { Agent, CursorAgentError, JsonlLocalAgentStore } from "@cursor/sdk";
 
 const repoRoot = process.cwd();
 
@@ -420,6 +421,107 @@ function createRemediationPr(
   console.log(`remediation PR: ${prUrl}`);
 }
 
+function verifyWorkingTreeRemediation(): string[] {
+  const paths = changedPaths();
+  if (paths.length === 0) {
+    throw new Error("investigator produced no Terraform remediation");
+  }
+  const blocked = paths.filter((path) => !isPermittedTerraformSource(path));
+  if (blocked.length > 0) {
+    throw new Error(
+      `investigator changed blocked files; refusing remediation PR: ${blocked.join(", ")}`,
+    );
+  }
+  return paths;
+}
+
+function createRemediationPrFromWorkingTree(
+  outcome: RemediationOutcome,
+  context: PullRequestContext,
+): void {
+  const remediations = verifyWorkingTreeRemediation();
+  const branchB = remediationBranchName();
+
+  runGh(["auth", "setup-git"]);
+  const remoteHead = runGit([
+    "ls-remote",
+    "--heads",
+    "origin",
+    `refs/heads/${context.branchA}`,
+  ])
+    .split(/\s+/)
+    .at(0);
+  if (remoteHead !== context.headSha) {
+    throw new Error(
+      "developer branch advanced during investigation; refusing stale remediation PR",
+    );
+  }
+  if (runGit(["rev-parse", "HEAD"]) !== context.headSha) {
+    throw new Error("checkout does not match the pull request head SHA");
+  }
+
+  runGit(["checkout", "-b", branchB]);
+  runGit(["add", "--", ...remediations]);
+  execFileSync(
+    "git",
+    [
+      "-c",
+      "user.name=github-actions[bot]",
+      "-c",
+      "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+      "commit",
+      "-m",
+      "Remediate Terraform policy denial",
+      "--",
+      ...remediations,
+    ],
+    { cwd: repoRoot, stdio: "inherit", env: process.env },
+  );
+  runGit(["push", "-u", "origin", branchB]);
+
+  const prUrl = runGh([
+    "pr",
+    "create",
+    "--repo",
+    process.env.GITHUB_REPOSITORY!,
+    "--head",
+    branchB,
+    "--base",
+    context.branchA,
+    "--title",
+    "Remediate Terraform policy denial",
+    "--body",
+    buildPrBody(outcome),
+  ]);
+  console.log(`remediation PR: ${prUrl}`);
+}
+
+async function applyLocalRemediation(prompt: string): Promise<void> {
+  const restoreGithubCredentials = hideGithubCredentials();
+  try {
+    const store = new JsonlLocalAgentStore(
+      mkdtempSync(join(tmpdir(), "cursor-agent-")),
+    );
+    const result = await Agent.prompt(prompt, {
+      apiKey: process.env.CURSOR_API_KEY,
+      model: { id: "composer-2.5" },
+      local: {
+        cwd: repoRoot,
+        store,
+      },
+    });
+    console.log(`local run.id=${result.id} status=${result.status}`);
+    if (result.status !== "finished") {
+      throw new Error(`local investigator did not finish: ${result.status}`);
+    }
+    if (result.result) {
+      console.log(`local run.result=${result.result}`);
+    }
+  } finally {
+    restoreGithubCredentials();
+  }
+}
+
 function createNoCodeFixIssue(
   outcome: NoCodeFixOutcome,
   context: PullRequestContext,
@@ -540,7 +642,7 @@ async function waitForCloudBranches(
     return immediate;
   }
 
-  for (let attempt = 1; attempt <= 12; attempt += 1) {
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 5000));
     const run = await Agent.getRun(runId, {
       runtime: "cloud",
@@ -687,15 +789,23 @@ async function main(): Promise<void> {
   );
   console.log(JSON.stringify(outcome, null, 2));
   if (outcome.outcome === "remediation") {
-    if (cloudBranches.length !== 1) {
+    if (cloudBranches.length === 1) {
+      createRemediationPr(outcome, context, cloudBranches[0]);
+      return;
+    }
+    if (cloudBranches.length > 1) {
       throw new Error(
         `remediation outcome requires exactly one investigator branch; found ${cloudBranches.length}`,
       );
     }
-    createRemediationPr(outcome, context, cloudBranches[0]);
-  } else {
-    createNoCodeFixIssue(outcome, context, cloudBranches);
+    console.log(
+      "cloud investigator produced no persisted branch; applying a local workspace edit",
+    );
+    await applyLocalRemediation(prompt);
+    createRemediationPrFromWorkingTree(outcome, context);
+    return;
   }
+  createNoCodeFixIssue(outcome, context, cloudBranches);
 }
 
 main().catch((error: unknown) => {
