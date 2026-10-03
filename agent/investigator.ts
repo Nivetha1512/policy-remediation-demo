@@ -37,6 +37,11 @@ type PullRequestContext = {
   url: string;
 };
 
+type CloudBranch = {
+  branch: string;
+  prUrl?: string;
+};
+
 function runGit(
   args: string[],
   options: { allowFailure?: boolean } = {},
@@ -356,7 +361,7 @@ function remediationBranchName(): string {
 function createRemediationPr(
   outcome: RemediationOutcome,
   context: PullRequestContext,
-  cloudBranch: string,
+  cloud: CloudBranch,
 ): void {
   const branchB = remediationBranchName();
 
@@ -375,7 +380,7 @@ function createRemediationPr(
     );
   }
 
-  const cloudCommit = fetchCloudBranch(cloudBranch);
+  const cloudCommit = fetchCloudBranch(cloud.branch);
   if (
     runGit(["merge-base", context.headSha, cloudCommit]) !== context.headSha
   ) {
@@ -384,10 +389,19 @@ function createRemediationPr(
     );
   }
   verifyRemediationChanges(context.headSha, cloudCommit);
+  if (cloud.prUrl) {
+    runGh([
+      "pr",
+      "close",
+      cloud.prUrl,
+      "--repo",
+      process.env.GITHUB_REPOSITORY!,
+    ]);
+  }
 
   runGit(["branch", branchB, cloudCommit]);
   runGit(["push", "-u", "origin", branchB]);
-  runGit(["push", "origin", "--delete", cloudBranch]);
+  runGit(["push", "origin", "--delete", cloud.branch]);
 
   const prUrl = runGh([
     "pr",
@@ -409,7 +423,7 @@ function createRemediationPr(
 function createNoCodeFixIssue(
   outcome: NoCodeFixOutcome,
   context: PullRequestContext,
-  cloudBranches: string[],
+  cloudBranches: CloudBranch[],
 ): void {
   const paths = changedPaths();
   if (paths.length > 0) {
@@ -418,15 +432,24 @@ function createNoCodeFixIssue(
     );
   }
   runGh(["auth", "setup-git"]);
-  for (const branch of cloudBranches) {
-    const cloudCommit = fetchCloudBranch(branch);
+  for (const cloud of cloudBranches) {
+    const cloudCommit = fetchCloudBranch(cloud.branch);
     const remotePaths = remoteChangedPaths(context.headSha, cloudCommit);
     if (remotePaths.length > 0) {
       throw new Error(
-        `no_code_fix outcome changed files on ${branch}; refusing issue creation: ${remotePaths.join(", ")}`,
+        `no_code_fix outcome changed files on ${cloud.branch}; refusing issue creation: ${remotePaths.join(", ")}`,
       );
     }
-    runGit(["push", "origin", "--delete", branch]);
+    if (cloud.prUrl) {
+      runGh([
+        "pr",
+        "close",
+        cloud.prUrl,
+        "--repo",
+        process.env.GITHUB_REPOSITORY!,
+      ]);
+    }
+    runGit(["push", "origin", "--delete", cloud.branch]);
   }
 
   const issueBody = [
@@ -549,7 +572,7 @@ async function main(): Promise<void> {
             startingRef: context.headSha,
           },
         ],
-        autoCreatePR: false,
+        autoCreatePR: true,
         skipReviewerRequest: true,
       },
     });
@@ -601,8 +624,11 @@ async function main(): Promise<void> {
   const outcome = parseOutcome(result.result ?? "");
   const cloudBranches =
     result.git?.branches
-      .map((branch) => branch.branch)
-      .filter((branch): branch is string => Boolean(branch)) ?? [];
+      .filter(
+        (branch): branch is typeof branch & { branch: string } =>
+          typeof branch.branch === "string" && branch.branch !== "",
+      )
+      .map((branch) => ({ branch: branch.branch, prUrl: branch.prUrl })) ?? [];
   console.log(JSON.stringify(outcome, null, 2));
   if (outcome.outcome === "remediation") {
     if (cloudBranches.length !== 1) {
