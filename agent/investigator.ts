@@ -85,20 +85,140 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function waitForRun(run: Run, label: string): Promise<{
-  id: string;
-  status: string;
-  result?: string;
-  git?: CloudGit;
-  error?: { message: string; code?: string };
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringField(
+  value: Record<string, unknown>,
+  keys: string[],
+): string | undefined {
+  for (const key of keys) {
+    const field = value[key];
+    if (typeof field === "string" && field !== "") {
+      return field;
+    }
+  }
+  return undefined;
+}
+
+function workspaceTerraformPath(raw: string): string | undefined {
+  let relative = raw.replace(/^\/+/, "");
+  relative = relative.replace(/^workspace\//, "");
+  if (relative.startsWith("artifacts/")) {
+    relative = relative.slice("artifacts/".length);
+  }
+  relative = relative.replace(/^workspace\//, "");
+  return isPermittedTerraformSource(relative) ? relative : undefined;
+}
+
+function mergeTerraformFiles(
+  files: TerraformArtifact[],
+): TerraformArtifact[] {
+  const byPath = new Map<string, Buffer>();
+  for (const file of files) {
+    byPath.set(file.path, file.contents);
+  }
+  return [...byPath.entries()].map(([path, contents]) => ({ path, contents }));
+}
+
+function captureTerraformFromTool(
+  event: {
+    name: string;
+    args?: unknown;
+    result?: unknown;
+  },
+  previous: Map<string, Buffer>,
+): TerraformArtifact[] {
+  const args = isRecord(event.args) ? event.args : {};
+  const result = isRecord(event.result) ? event.result : {};
+  const pathRaw =
+    stringField(args, ["path", "file_path", "filePath"]) ??
+    stringField(result, ["path", "file_path", "filePath"]);
+  if (!pathRaw) {
+    return [];
+  }
+  const path = workspaceTerraformPath(pathRaw);
+  if (!path) {
+    return [];
+  }
+
+  const fullText =
+    stringField(args, ["fileText", "contents", "content"]) ??
+    stringField(result, ["fileContentAfterWrite", "contents", "content"]);
+  if (
+    typeof fullText === "string" &&
+    (event.name.toLowerCase().includes("write") ||
+      fullText.includes("\n") ||
+      previous.has(path))
+  ) {
+    if (
+      event.name.toLowerCase().includes("write") ||
+      fullText.includes("\n")
+    ) {
+      return [{ path, contents: Buffer.from(fullText) }];
+    }
+  }
+
+  const oldString = stringField(args, [
+    "old_string",
+    "oldString",
+    "old_str",
+  ]);
+  const newString = stringField(args, [
+    "new_string",
+    "newString",
+    "new_str",
+  ]);
+  if (oldString !== undefined && newString !== undefined) {
+    const base = previous.get(path)
+      ? previous.get(path)!.toString("utf8")
+      : existsSync(join(repoRoot, path))
+        ? readFileSync(join(repoRoot, path), "utf8")
+        : undefined;
+    if (base === undefined || !base.includes(oldString)) {
+      console.log(`cloud edit old_string not found in ${path}`);
+      return [];
+    }
+    return [{ path, contents: Buffer.from(base.replace(oldString, newString)) }];
+  }
+
+  return [];
+}
+
+async function waitForRun(
+  run: Run,
+  label: string,
+): Promise<{
+  result: Awaited<ReturnType<Run["wait"]>>;
+  terraformFiles: TerraformArtifact[];
 }> {
   const tools: string[] = [];
+  const captured = new Map<string, Buffer>();
   const stream = run.supports("stream")
     ? (async () => {
         for await (const event of run.stream()) {
-          if (event.type === "tool_call") {
-            console.log(`${label} tool ${event.name} ${event.status}`);
-            tools.push(`${event.name}:${event.status}`);
+          if (event.type !== "tool_call") {
+            continue;
+          }
+          console.log(`${label} tool ${event.name} ${event.status}`);
+          tools.push(`${event.name}:${event.status}`);
+          if (
+            /edit|write|replace/i.test(event.name) &&
+            (event.status === "completed" || event.status === "running")
+          ) {
+            console.log(
+              `${label} ${event.name} args=${JSON.stringify(event.args ?? null).slice(0, 4000)}`,
+            );
+            if (event.result !== undefined) {
+              console.log(
+                `${label} ${event.name} result=${JSON.stringify(event.result).slice(0, 4000)}`,
+              );
+            }
+            for (const file of captureTerraformFromTool(event, captured)) {
+              captured.set(file.path, file.contents);
+              console.log(`captured cloud terraform edit ${file.path}`);
+            }
           }
         }
       })().catch((error: unknown) => {
@@ -110,7 +230,13 @@ async function waitForRun(run: Run, label: string): Promise<{
   console.log(
     `${label} tools=${tools.length > 0 ? tools.join(",") : "(none)"}`,
   );
-  return result;
+  return {
+    result,
+    terraformFiles: [...captured.entries()].map(([path, contents]) => ({
+      path,
+      contents,
+    })),
+  };
 }
 
 function runGit(
@@ -822,10 +948,15 @@ async function waitForCloudPersist(
 
 async function sendCloudPersistFollowUp(
   agent: SDKAgent,
-): Promise<{ id: string; git?: CloudGit; status: string }> {
+): Promise<{
+  id: string;
+  git?: CloudGit;
+  status: string;
+  terraformFiles: TerraformArtifact[];
+}> {
   const run = await agent.send(buildPersistPrompt(), { mode: "agent" });
   console.log(`persist run.id=${run.id}`);
-  const result = await waitForRun(run, "persist");
+  const { result, terraformFiles } = await waitForRun(run, "persist");
   console.log(`persist run.id=${result.id} status=${result.status}`);
   console.log(`persist run.git=${JSON.stringify(result.git ?? null)}`);
   if (result.error) {
@@ -834,7 +965,12 @@ async function sendCloudPersistFollowUp(
   if (result.result) {
     console.log(`persist run.result=${result.result}`);
   }
-  return { id: result.id, git: result.git, status: result.status };
+  return {
+    id: result.id,
+    git: result.git,
+    status: result.status,
+    terraformFiles,
+  };
 }
 
 async function requestCloudWorkspacePersist(
@@ -858,19 +994,33 @@ async function requestCloudWorkspacePersist(
         `persist retry did not finish: ${persistRun.status}; continuing with other cloud recovery paths`,
       );
     }
-    return waitForCloudPersist(
+    const snapshot = await waitForCloudPersist(
       resumed,
       persistRun.id,
       resumed.agentId,
       persistRun.git,
     );
+    return {
+      branches: snapshot.branches,
+      terraformFiles: mergeTerraformFiles([
+        ...persistRun.terraformFiles,
+        ...snapshot.terraformFiles,
+      ]),
+    };
   }
-  return waitForCloudPersist(
+  const snapshot = await waitForCloudPersist(
     agent,
     persistRun.id,
     agent.agentId,
     persistRun.git,
   );
+  return {
+    branches: snapshot.branches,
+    terraformFiles: mergeTerraformFiles([
+      ...persistRun.terraformFiles,
+      ...snapshot.terraformFiles,
+    ]),
+  };
 }
 
 function applyDownloadedTerraformFiles(files: TerraformArtifact[]): void {
@@ -1085,7 +1235,8 @@ async function main(): Promise<void> {
     console.log(`agent.id=${agent.agentId}`);
     const run = await agent.send(prompt, { mode: "agent" });
     console.log(`run.id=${run.id}`);
-    result = await waitForRun(run, "investigate");
+    const waited = await waitForRun(run, "investigate");
+    result = waited.result;
     console.log(`run.id=${result.id} status=${result.status}`);
     console.log(`run.git=${JSON.stringify(result.git ?? null)}`);
 
@@ -1111,12 +1262,26 @@ async function main(): Promise<void> {
       agent.agentId,
       result.git,
     );
+    persist = {
+      branches: persist.branches,
+      terraformFiles: mergeTerraformFiles([
+        ...waited.terraformFiles,
+        ...persist.terraformFiles,
+      ]),
+    };
     if (
       outcome.outcome === "remediation" &&
       persist.branches.length === 0 &&
       persist.terraformFiles.length === 0
     ) {
       persist = await requestCloudWorkspacePersist(agent);
+      persist = {
+        branches: persist.branches,
+        terraformFiles: mergeTerraformFiles([
+          ...waited.terraformFiles,
+          ...persist.terraformFiles,
+        ]),
+      };
     } else if (
       persist.branches.length === 0 &&
       persist.terraformFiles.length === 0
