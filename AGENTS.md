@@ -13,26 +13,17 @@ Investigate a Terraform policy denial and produce the smallest compliant remedia
 - Prefer the smallest compliant change.
 - Do not assume the fix belongs in the resource, the reusable module, or the caller.
 - Do not change reusable module defaults unless that is clearly the intended scope.
+- Never invent identifiers, ARNs, key IDs, resource IDs, names, or other values that do not exist in the repository or provided inputs.
+- If a safe compliant fix requires information or an external value that is not available, do not guess. Return `no_code_fix` and identify what is missing.
 - After editing, you may run `terraform fmt` on files you change. Do not treat local checks as final verification. The GitHub Actions policy gate on the remediation pull request is authoritative.
-- If no safe compliant code remediation can be justified from repository and policy context, do not edit source files. Report what information, exception, ownership decision, or external dependency is required.
-- Never commit, push, create or switch branches, create pull requests or issues, or post GitHub comments. Deterministic orchestration handles Git and GitHub operations.
+- When the platform provides a remediation branch/workspace, make changes only there.
+- Never push changes to the developer branch or `main`.
+- Do not create GitHub issues or post GitHub comments. Deterministic orchestration handles those operations.
+- Do not create additional branches or pull requests outside the platform-provided remediation flow.
 
 ## Investigation result
 
 Return exactly one machine-readable outcome:
 
 - `remediation` when a safe compliant code change was made.
-- `no_code_fix` when a safe code change cannot be justified.
-
-## Branch naming
-
-Demo violation branches:
-
-- `demo/encryption-failure`
-- `demo/kms-failure`
-
-Agent-generated remediation branches:
-
-- `policy-remediation/<short-description-or-run-id>`
-
-Do not create ad hoc `cursor/*` or `fix/*` branches for the demo workflow.
+- `no_code_fix` when a safe code change cannot be justified from the repository, policy, and provided inputs.
