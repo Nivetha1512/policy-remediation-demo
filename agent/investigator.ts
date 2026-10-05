@@ -1,11 +1,26 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdtempSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
-import { Agent, CursorAgentError, JsonlLocalAgentStore } from "@cursor/sdk";
+import {
+  Agent,
+  CursorAgentError,
+  JsonlLocalAgentStore,
+  type SDKAgent,
+  type SDKArtifact,
+} from "@cursor/sdk";
 
 const repoRoot = process.cwd();
+const CLOUD_PERSIST_ATTEMPTS = 8;
+const CLOUD_PERSIST_DELAY_MS = 5000;
 
 type PolicyResult = {
   deny?: unknown;
@@ -42,6 +57,32 @@ type CloudBranch = {
   branch: string;
   prUrl?: string;
 };
+
+type CloudGit = {
+  branches?: Array<{ branch?: string; prUrl?: string }>;
+};
+
+type TerraformArtifact = {
+  path: string;
+  contents: Buffer;
+};
+
+type CloudPersistResult = {
+  branches: CloudBranch[];
+  terraformFiles: TerraformArtifact[];
+};
+
+function runningOnGitHubActions(): boolean {
+  return process.env.GITHUB_ACTIONS === "true";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 function runGit(
   args: string[],
@@ -144,6 +185,24 @@ function buildPrompt(denies: string[]): string {
     "or",
     "",
     '{"outcome":"no_code_fix","violation":"...","rootCause":"...","reason":"...","recommendedAction":"..."}',
+  ].join("\n");
+}
+
+function buildPersistPrompt(): string {
+  return [
+    "Persist the Terraform remediation you already decided in the previous turn.",
+    "",
+    "Apply or save only that same smallest compliant Terraform .tf source change.",
+    "Do not change the remediation, do not edit policy, and do not edit non-.tf files.",
+    "Do not invent a new fix.",
+    "Leave the change saved in this workspace so Cursor can persist a git branch.",
+    "If Cursor stores workspace copies under artifacts/, also copy the changed .tf files there using their repository paths.",
+    "",
+    "Do not create pull requests, issues, or GitHub comments.",
+    "Do not push to the developer branch or to main.",
+    "Orchestration handles all GitHub mechanics after you finish.",
+    "",
+    "When done, return the same JSON outcome object as before, with no Markdown fence.",
   ].join("\n");
 }
 
@@ -497,6 +556,12 @@ function createRemediationPrFromWorkingTree(
 }
 
 async function applyLocalRemediation(prompt: string): Promise<void> {
+  if (runningOnGitHubActions()) {
+    throw new Error(
+      "local Cursor SDK runtime is not invoked on GitHub Actions",
+    );
+  }
+
   const restoreGithubCredentials = hideGithubCredentials();
   try {
     const store = new JsonlLocalAgentStore(
@@ -611,13 +676,7 @@ function createNoCodeFixIssue(
   console.log(`follow-up issue: ${issueUrl}`);
 }
 
-function extractCloudBranches(
-  git:
-    | {
-        branches?: Array<{ branch?: string; prUrl?: string }>;
-      }
-    | undefined,
-): CloudBranch[] {
+function extractCloudBranches(git: CloudGit | undefined): CloudBranch[] {
   return (
     git?.branches
       ?.filter(
@@ -628,37 +687,208 @@ function extractCloudBranches(
   );
 }
 
-async function waitForCloudBranches(
-  resultGit:
-    | {
-        branches?: Array<{ branch?: string; prUrl?: string }>;
-      }
-    | undefined,
+function terraformPathFromArtifact(artifactPath: string): string | undefined {
+  const trimmed = artifactPath.replace(/^\/+/, "");
+  const relative = trimmed.startsWith("artifacts/")
+    ? trimmed.slice("artifacts/".length)
+    : trimmed;
+  if (!isPermittedTerraformSource(relative)) {
+    return undefined;
+  }
+  return relative;
+}
+
+async function downloadTerraformArtifacts(
+  agent: SDKAgent,
+): Promise<TerraformArtifact[]> {
+  let artifacts: SDKArtifact[] = [];
+  try {
+    artifacts = await agent.listArtifacts();
+  } catch (error) {
+    console.log(`listArtifacts failed: ${errorMessage(error)}`);
+    return [];
+  }
+  console.log(`cloud artifacts: ${JSON.stringify(artifacts)}`);
+
+  const files: TerraformArtifact[] = [];
+  for (const artifact of artifacts) {
+    const path = terraformPathFromArtifact(artifact.path);
+    if (!path) {
+      continue;
+    }
+    try {
+      files.push({
+        path,
+        contents: await agent.downloadArtifact(artifact.path),
+      });
+    } catch (error) {
+      console.log(
+        `downloadArtifact failed for ${artifact.path}: ${errorMessage(error)}`,
+      );
+    }
+  }
+  return files;
+}
+
+async function snapshotCloudPersist(
+  agent: SDKAgent,
   runId: string,
   agentId: string,
-): Promise<CloudBranch[]> {
+  resultGit?: CloudGit,
+): Promise<CloudPersistResult> {
+  const terraformFiles = await downloadTerraformArtifacts(agent);
   const immediate = extractCloudBranches(resultGit);
   if (immediate.length > 0) {
-    return immediate;
+    return { branches: immediate, terraformFiles };
   }
 
-  for (let attempt = 1; attempt <= 4; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 5000));
+  try {
     const run = await Agent.getRun(runId, {
       runtime: "cloud",
       agentId,
       apiKey: process.env.CURSOR_API_KEY,
     });
-    const branches = extractCloudBranches(run.git);
+    console.log(`cloud git snapshot: ${JSON.stringify(run.git ?? null)}`);
+    return {
+      branches: extractCloudBranches(run.git),
+      terraformFiles,
+    };
+  } catch (error) {
+    console.log(`Agent.getRun failed: ${errorMessage(error)}`);
+    return { branches: [], terraformFiles };
+  }
+}
+
+async function waitForCloudPersist(
+  agent: SDKAgent,
+  runId: string,
+  agentId: string,
+  resultGit?: CloudGit,
+): Promise<CloudPersistResult> {
+  const immediate = await snapshotCloudPersist(
+    agent,
+    runId,
+    agentId,
+    resultGit,
+  );
+  if (immediate.branches.length > 0 || immediate.terraformFiles.length > 0) {
+    return immediate;
+  }
+
+  for (let attempt = 1; attempt <= CLOUD_PERSIST_ATTEMPTS; attempt += 1) {
+    await sleep(CLOUD_PERSIST_DELAY_MS);
+    const snapshot = await snapshotCloudPersist(agent, runId, agentId);
     console.log(
-      `cloud git poll ${attempt}: ${JSON.stringify(run.git ?? null)}`,
+      `cloud persist poll ${attempt}: branches=${JSON.stringify(snapshot.branches)} files=${snapshot.terraformFiles.map((file) => file.path).join(",") || "(none)"}`,
     );
-    if (branches.length > 0) {
-      return branches;
+    if (snapshot.branches.length > 0 || snapshot.terraformFiles.length > 0) {
+      return snapshot;
     }
   }
 
-  return [];
+  return { branches: [], terraformFiles: [] };
+}
+
+async function requestCloudWorkspacePersist(
+  agent: SDKAgent,
+): Promise<CloudPersistResult> {
+  console.log(
+    "cloud investigator produced no named branch; requesting persist of the already decided Terraform edit",
+  );
+  const run = await agent.send(buildPersistPrompt());
+  console.log(`persist run.id=${run.id}`);
+  const result = await run.wait();
+  console.log(`persist run.id=${result.id} status=${result.status}`);
+  console.log(`persist run.git=${JSON.stringify(result.git ?? null)}`);
+  if (result.status !== "finished") {
+    console.log(
+      `persist follow-up did not finish: ${result.status}; continuing with other cloud recovery paths`,
+    );
+  }
+  return waitForCloudPersist(agent, result.id, agent.agentId, result.git);
+}
+
+function applyDownloadedTerraformFiles(files: TerraformArtifact[]): void {
+  if (files.length === 0) {
+    throw new Error("cloud investigator produced no Terraform artifacts");
+  }
+  for (const file of files) {
+    if (!isPermittedTerraformSource(file.path)) {
+      throw new Error(
+        `investigator artifact is not permitted Terraform source: ${file.path}`,
+      );
+    }
+    const absolutePath = join(repoRoot, file.path);
+    mkdirSync(dirname(absolutePath), { recursive: true });
+    writeFileSync(absolutePath, file.contents);
+    console.log(`copied cloud artifact to ${file.path}`);
+  }
+}
+
+function reservedBranch(branch: string, branchA: string): boolean {
+  return (
+    branch === "main" ||
+    branch === branchA ||
+    branch.startsWith("demo/") ||
+    branch.startsWith("policy-remediation/")
+  );
+}
+
+function openPullRequestsByHead(): Map<string, string> {
+  const raw = runGh([
+    "pr",
+    "list",
+    "--repo",
+    process.env.GITHUB_REPOSITORY!,
+    "--state",
+    "open",
+    "--limit",
+    "100",
+    "--json",
+    "url,headRefName",
+  ]);
+  const prs = JSON.parse(raw) as Array<{ url: string; headRefName: string }>;
+  return new Map(prs.map((pr) => [pr.headRefName, pr.url]));
+}
+
+function remoteHeadNames(): string[] {
+  const output = runGit(["ls-remote", "--heads", "origin"]);
+  return output
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.split("\t")[1]?.replace(/^refs\/heads\//, ""))
+    .filter((branch): branch is string => Boolean(branch));
+}
+
+function findPersistedCloudRemediation(
+  context: PullRequestContext,
+): CloudBranch[] {
+  runGh(["auth", "setup-git"]);
+  const prByHead = openPullRequestsByHead();
+  const heads = [
+    ...new Set([...prByHead.keys(), ...remoteHeadNames()]),
+  ].filter((branch) => !reservedBranch(branch, context.branchA));
+  const preferred = heads.filter((branch) => branch.startsWith("cursor/"));
+  const candidates = preferred.length > 0 ? preferred : heads;
+  const matches: CloudBranch[] = [];
+
+  for (const branch of candidates) {
+    try {
+      const cloudCommit = fetchCloudBranch(branch);
+      if (
+        runGit(["merge-base", context.headSha, cloudCommit]) !== context.headSha
+      ) {
+        continue;
+      }
+      verifyRemediationChanges(context.headSha, cloudCommit);
+      matches.push({ branch, prUrl: prByHead.get(branch) });
+    } catch (error) {
+      console.log(
+        `skipping candidate branch ${branch}: ${errorMessage(error)}`,
+      );
+    }
+  }
+  return matches;
 }
 
 function hideGithubCredentials(): () => void {
@@ -676,6 +906,59 @@ function hideGithubCredentials(): () => void {
       process.env.GITHUB_TOKEN = saved.GITHUB_TOKEN;
     }
   };
+}
+
+async function openRemediationPullRequest(
+  outcome: RemediationOutcome,
+  context: PullRequestContext,
+  persist: CloudPersistResult,
+  prompt: string,
+): Promise<void> {
+  if (persist.branches.length === 1) {
+    createRemediationPr(outcome, context, persist.branches[0]);
+    return;
+  }
+  if (persist.branches.length > 1) {
+    throw new Error(
+      `remediation outcome requires exactly one investigator branch; found ${persist.branches.length}`,
+    );
+  }
+
+  if (persist.terraformFiles.length > 0) {
+    console.log(
+      "cloud investigator persisted Terraform artifacts; copying them into the checkout",
+    );
+    applyDownloadedTerraformFiles(persist.terraformFiles);
+    createRemediationPrFromWorkingTree(outcome, context);
+    return;
+  }
+
+  const discovered = findPersistedCloudRemediation(context);
+  if (discovered.length === 1) {
+    console.log(
+      `found persisted cloud branch ${discovered[0].branch} without SDK branch name`,
+    );
+    createRemediationPr(outcome, context, discovered[0]);
+    return;
+  }
+  if (discovered.length > 1) {
+    throw new Error(
+      `remediation outcome requires exactly one investigator branch; found ${discovered.length}`,
+    );
+  }
+
+  if (!runningOnGitHubActions()) {
+    console.log(
+      "cloud investigator produced no persisted branch; applying a local workspace edit",
+    );
+    await applyLocalRemediation(prompt);
+    createRemediationPrFromWorkingTree(outcome, context);
+    return;
+  }
+
+  throw new Error(
+    "cloud investigator produced a remediation but no named branch, Terraform artifacts, or Cursor pull request",
+  );
 }
 
 async function main(): Promise<void> {
@@ -710,7 +993,8 @@ async function main(): Promise<void> {
   const prompt = buildPrompt(denies);
 
   let result;
-  let agentId = "";
+  let outcome: InvestigatorOutcome | undefined;
+  let persist: CloudPersistResult = { branches: [], terraformFiles: [] };
   const restoreGithubCredentials = hideGithubCredentials();
   try {
     const repository = process.env.GITHUB_REPOSITORY!;
@@ -730,11 +1014,42 @@ async function main(): Promise<void> {
         skipReviewerRequest: true,
       },
     });
-    agentId = agent.agentId;
-    console.log(`agent.id=${agentId}`);
+    console.log(`agent.id=${agent.agentId}`);
     const run = await agent.send(prompt);
     console.log(`run.id=${run.id}`);
     result = await run.wait();
+    console.log(`run.id=${result.id} status=${result.status}`);
+    console.log(`run.git=${JSON.stringify(result.git ?? null)}`);
+
+    if (result.status === "error") {
+      console.error(`run failed: ${result.id}`);
+      if (result.error?.message) {
+        console.error(result.error.message);
+      }
+      process.exitCode = 2;
+      return;
+    }
+
+    if (result.status !== "finished") {
+      console.error(`run did not finish: ${result.status}`);
+      process.exitCode = 2;
+      return;
+    }
+
+    outcome = parseOutcome(result.result ?? "");
+    persist = await waitForCloudPersist(
+      agent,
+      result.id,
+      agent.agentId,
+      result.git,
+    );
+    if (
+      outcome.outcome === "remediation" &&
+      persist.branches.length === 0 &&
+      persist.terraformFiles.length === 0
+    ) {
+      persist = await requestCloudWorkspacePersist(agent);
+    }
   } catch (error) {
     if (error instanceof CursorAgentError) {
       console.error(
@@ -748,22 +1063,11 @@ async function main(): Promise<void> {
     restoreGithubCredentials();
   }
 
-  console.log(`run.id=${result.id} status=${result.status}`);
-  console.log(`run.git=${JSON.stringify(result.git ?? null)}`);
-
-  if (result.status === "error") {
-    console.error(`run failed: ${result.id}`);
-    if (result.error?.message) {
-      console.error(result.error.message);
-    }
-    process.exitCode = 2;
+  if (process.exitCode) {
     return;
   }
-
-  if (result.status !== "finished") {
-    console.error(`run did not finish: ${result.status}`);
-    process.exitCode = 2;
-    return;
+  if (!outcome) {
+    throw new Error("investigator did not return an outcome");
   }
 
   if (runGit(["rev-parse", "HEAD"]) !== initialHead) {
@@ -781,31 +1085,12 @@ async function main(): Promise<void> {
     );
   }
 
-  const outcome = parseOutcome(result.result ?? "");
-  const cloudBranches = await waitForCloudBranches(
-    result.git,
-    result.id,
-    agentId,
-  );
   console.log(JSON.stringify(outcome, null, 2));
   if (outcome.outcome === "remediation") {
-    if (cloudBranches.length === 1) {
-      createRemediationPr(outcome, context, cloudBranches[0]);
-      return;
-    }
-    if (cloudBranches.length > 1) {
-      throw new Error(
-        `remediation outcome requires exactly one investigator branch; found ${cloudBranches.length}`,
-      );
-    }
-    console.log(
-      "cloud investigator produced no persisted branch; applying a local workspace edit",
-    );
-    await applyLocalRemediation(prompt);
-    createRemediationPrFromWorkingTree(outcome, context);
+    await openRemediationPullRequest(outcome, context, persist, prompt);
     return;
   }
-  createNoCodeFixIssue(outcome, context, cloudBranches);
+  createNoCodeFixIssue(outcome, context, persist.branches);
 }
 
 main().catch((error: unknown) => {
