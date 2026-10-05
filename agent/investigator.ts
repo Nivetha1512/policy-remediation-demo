@@ -154,14 +154,14 @@ function captureTerraformFromTool(
   }
 
   const fullText =
-    stringField(args, ["streamContent", "fileText", "contents", "content"]) ??
     stringField(result, [
       "afterFullFileContent",
       "fileContentAfterWrite",
       "streamContent",
       "contents",
       "content",
-    ]);
+    ]) ??
+    stringField(args, ["streamContent", "fileText", "contents", "content"]);
   if (typeof fullText === "string" && fullText.includes("\n")) {
     return [{ path, contents: Buffer.from(fullText) }];
   }
@@ -1043,6 +1043,15 @@ function applyDownloadedTerraformFiles(files: TerraformArtifact[]): void {
     mkdirSync(dirname(absolutePath), { recursive: true });
     writeFileSync(absolutePath, file.contents);
     console.log(`copied cloud artifact to ${file.path}`);
+  }
+  try {
+    execFileSync(
+      "terraform",
+      ["fmt", "--", ...files.map((file) => file.path)],
+      { cwd: repoRoot, stdio: "inherit", env: process.env },
+    );
+  } catch (error) {
+    console.log(`terraform fmt skipped: ${errorMessage(error)}`);
   }
 }
 
