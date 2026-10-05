@@ -14,6 +14,7 @@ import {
   Agent,
   CursorAgentError,
   JsonlLocalAgentStore,
+  type Run,
   type SDKAgent,
   type SDKArtifact,
 } from "@cursor/sdk";
@@ -82,6 +83,34 @@ function sleep(ms: number): Promise<void> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function waitForRun(run: Run, label: string): Promise<{
+  id: string;
+  status: string;
+  result?: string;
+  git?: CloudGit;
+  error?: { message: string; code?: string };
+}> {
+  const tools: string[] = [];
+  const stream = run.supports("stream")
+    ? (async () => {
+        for await (const event of run.stream()) {
+          if (event.type === "tool_call") {
+            console.log(`${label} tool ${event.name} ${event.status}`);
+            tools.push(`${event.name}:${event.status}`);
+          }
+        }
+      })().catch((error: unknown) => {
+        console.log(`${label} stream ended: ${errorMessage(error)}`);
+      })
+    : Promise.resolve();
+  const result = await run.wait();
+  await stream;
+  console.log(
+    `${label} tools=${tools.length > 0 ? tools.join(",") : "(none)"}`,
+  );
+  return result;
 }
 
 function runGit(
@@ -164,8 +193,8 @@ function buildPrompt(denies: string[]): string {
     "Determine whether a safe compliant code remediation can be made using only the repository and available plan/policy context.",
     "",
     "If yes:",
-    "- apply the smallest compliant Terraform .tf source change in this workspace",
-    "- save that .tf edit so the cloud workspace can persist a git branch",
+    "- use file edit tools (Write or StrReplace) to apply the smallest compliant Terraform .tf source change",
+    "- copy each changed .tf file into artifacts/ using the same repository-relative path",
     "- minimize blast radius",
     "- do not modify policy",
     '- return outcome="remediation"',
@@ -179,7 +208,7 @@ function buildPrompt(denies: string[]): string {
     "Do not push to the developer branch or to main.",
     "Orchestration handles all GitHub mechanics after you finish.",
     "",
-    "Return only one JSON object, with no Markdown fence or other text, matching exactly one of these shapes:",
+    "After any required file edits, your final message must be only one JSON object, with no Markdown fence or other text, matching exactly one of these shapes:",
     "",
     '{"outcome":"remediation","violation":"...","rootCause":"...","filesExamined":["..."],"remediation":"...","whyThisLocation":"..."}',
     "",
@@ -191,20 +220,18 @@ function buildPrompt(denies: string[]): string {
 
 function buildPersistPrompt(): string {
   return [
-    "The previous turn identified a safe Terraform remediation but Cursor did not persist a named git branch.",
-    "Use your file tools now to apply or re-save that same smallest compliant Terraform .tf source change.",
-    "The previous turn may have returned JSON without writing the file; write the .tf edit this turn.",
+    "The previous turn identified a safe Terraform remediation, but Cursor did not persist a named git branch or artifacts.",
+    "A JSON-only reply is not enough.",
+    "You must use file edit tools this turn before you answer:",
+    "1. Re-apply the same smallest compliant Terraform .tf source change with Write or StrReplace, even if you believe it is already saved.",
+    "2. Copy each changed .tf file into artifacts/<repository-relative-path> so orchestration can download it.",
     "",
     "Do not change the remediation, do not edit policy, and do not edit non-.tf files.",
     "Do not invent a new fix or choose a different location.",
-    "Leave the change saved in this workspace so Cursor can persist a git branch.",
-    "If Cursor stores workspace copies under artifacts/, also copy the changed .tf files there using their repository paths.",
-    "",
-    "Do not create pull requests, issues, or GitHub comments.",
-    "Do not push to the developer branch or to main.",
+    "Do not use gh, create pull requests, issues, or GitHub comments, or push to the developer branch or main.",
     "Orchestration handles all GitHub mechanics after you finish.",
     "",
-    "When done, return the same JSON outcome object as before, with no Markdown fence.",
+    "After those tool calls, your final message must be the same JSON outcome object as before, with no Markdown fence.",
   ].join("\n");
 }
 
@@ -690,10 +717,12 @@ function extractCloudBranches(git: CloudGit | undefined): CloudBranch[] {
 }
 
 function terraformPathFromArtifact(artifactPath: string): string | undefined {
-  const trimmed = artifactPath.replace(/^\/+/, "");
-  const relative = trimmed.startsWith("artifacts/")
-    ? trimmed.slice("artifacts/".length)
-    : trimmed;
+  let relative = artifactPath.replace(/^\/+/, "");
+  relative = relative.replace(/^workspace\//, "");
+  if (relative.startsWith("artifacts/")) {
+    relative = relative.slice("artifacts/".length);
+  }
+  relative = relative.replace(/^workspace\//, "");
   if (!isPermittedTerraformSource(relative)) {
     return undefined;
   }
@@ -794,9 +823,9 @@ async function waitForCloudPersist(
 async function sendCloudPersistFollowUp(
   agent: SDKAgent,
 ): Promise<{ id: string; git?: CloudGit; status: string }> {
-  const run = await agent.send(buildPersistPrompt());
+  const run = await agent.send(buildPersistPrompt(), { mode: "agent" });
   console.log(`persist run.id=${run.id}`);
-  const result = await run.wait();
+  const result = await waitForRun(run, "persist");
   console.log(`persist run.id=${result.id} status=${result.status}`);
   console.log(`persist run.git=${JSON.stringify(result.git ?? null)}`);
   if (result.error) {
@@ -1054,9 +1083,9 @@ async function main(): Promise<void> {
       },
     });
     console.log(`agent.id=${agent.agentId}`);
-    const run = await agent.send(prompt);
+    const run = await agent.send(prompt, { mode: "agent" });
     console.log(`run.id=${run.id}`);
-    result = await run.wait();
+    result = await waitForRun(run, "investigate");
     console.log(`run.id=${result.id} status=${result.status}`);
     console.log(`run.git=${JSON.stringify(result.git ?? null)}`);
 
