@@ -165,6 +165,7 @@ function buildPrompt(denies: string[]): string {
     "",
     "If yes:",
     "- apply the smallest compliant Terraform .tf source change in this workspace",
+    "- save that .tf edit so the cloud workspace can persist a git branch",
     "- minimize blast radius",
     "- do not modify policy",
     '- return outcome="remediation"',
@@ -190,11 +191,12 @@ function buildPrompt(denies: string[]): string {
 
 function buildPersistPrompt(): string {
   return [
-    "Persist the Terraform remediation you already decided in the previous turn.",
+    "The previous turn identified a safe Terraform remediation but Cursor did not persist a named git branch.",
+    "Use your file tools now to apply or re-save that same smallest compliant Terraform .tf source change.",
+    "The previous turn may have returned JSON without writing the file; write the .tf edit this turn.",
     "",
-    "Apply or save only that same smallest compliant Terraform .tf source change.",
     "Do not change the remediation, do not edit policy, and do not edit non-.tf files.",
-    "Do not invent a new fix.",
+    "Do not invent a new fix or choose a different location.",
     "Leave the change saved in this workspace so Cursor can persist a git branch.",
     "If Cursor stores workspace copies under artifacts/, also copy the changed .tf files there using their repository paths.",
     "",
@@ -789,23 +791,57 @@ async function waitForCloudPersist(
   return { branches: [], terraformFiles: [] };
 }
 
-async function requestCloudWorkspacePersist(
+async function sendCloudPersistFollowUp(
   agent: SDKAgent,
-): Promise<CloudPersistResult> {
-  console.log(
-    "cloud investigator produced no named branch; requesting persist of the already decided Terraform edit",
-  );
+): Promise<{ id: string; git?: CloudGit; status: string }> {
   const run = await agent.send(buildPersistPrompt());
   console.log(`persist run.id=${run.id}`);
   const result = await run.wait();
   console.log(`persist run.id=${result.id} status=${result.status}`);
   console.log(`persist run.git=${JSON.stringify(result.git ?? null)}`);
-  if (result.status !== "finished") {
+  if (result.error) {
+    console.log(`persist run.error=${JSON.stringify(result.error)}`);
+  }
+  if (result.result) {
+    console.log(`persist run.result=${result.result}`);
+  }
+  return { id: result.id, git: result.git, status: result.status };
+}
+
+async function requestCloudWorkspacePersist(
+  agent: SDKAgent,
+): Promise<CloudPersistResult> {
+  console.log(
+    "cloud investigator produced no named branch; requesting persist of the already decided Terraform edit immediately",
+  );
+  let persistRun = await sendCloudPersistFollowUp(agent);
+  if (persistRun.status !== "finished") {
     console.log(
-      `persist follow-up did not finish: ${result.status}; continuing with other cloud recovery paths`,
+      `persist follow-up did not finish: ${persistRun.status}; retrying on a resumed cloud agent`,
+    );
+    await using resumed = await Agent.resume(agent.agentId, {
+      apiKey: process.env.CURSOR_API_KEY,
+      model: { id: "composer-2.5" },
+    });
+    persistRun = await sendCloudPersistFollowUp(resumed);
+    if (persistRun.status !== "finished") {
+      console.log(
+        `persist retry did not finish: ${persistRun.status}; continuing with other cloud recovery paths`,
+      );
+    }
+    return waitForCloudPersist(
+      resumed,
+      persistRun.id,
+      resumed.agentId,
+      persistRun.git,
     );
   }
-  return waitForCloudPersist(agent, result.id, agent.agentId, result.git);
+  return waitForCloudPersist(
+    agent,
+    persistRun.id,
+    agent.agentId,
+    persistRun.git,
+  );
 }
 
 function applyDownloadedTerraformFiles(files: TerraformArtifact[]): void {
@@ -870,6 +906,9 @@ function findPersistedCloudRemediation(
   ].filter((branch) => !reservedBranch(branch, context.branchA));
   const preferred = heads.filter((branch) => branch.startsWith("cursor/"));
   const candidates = preferred.length > 0 ? preferred : heads;
+  console.log(
+    `scanning ${candidates.length} candidate branches for persisted cloud remediation`,
+  );
   const matches: CloudBranch[] = [];
 
   for (const branch of candidates) {
@@ -1037,7 +1076,7 @@ async function main(): Promise<void> {
     }
 
     outcome = parseOutcome(result.result ?? "");
-    persist = await waitForCloudPersist(
+    persist = await snapshotCloudPersist(
       agent,
       result.id,
       agent.agentId,
@@ -1049,6 +1088,16 @@ async function main(): Promise<void> {
       persist.terraformFiles.length === 0
     ) {
       persist = await requestCloudWorkspacePersist(agent);
+    } else if (
+      persist.branches.length === 0 &&
+      persist.terraformFiles.length === 0
+    ) {
+      persist = await waitForCloudPersist(
+        agent,
+        result.id,
+        agent.agentId,
+        result.git,
+      );
     }
   } catch (error) {
     if (error instanceof CursorAgentError) {
