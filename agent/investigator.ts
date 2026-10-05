@@ -122,6 +122,16 @@ function mergeTerraformFiles(
   return [...byPath.entries()].map(([path, contents]) => ({ path, contents }));
 }
 
+function unwrapToolRecord(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) {
+    return {};
+  }
+  if (isRecord(value.success)) {
+    return { ...value, ...value.success };
+  }
+  return value;
+}
+
 function captureTerraformFromTool(
   event: {
     name: string;
@@ -130,8 +140,8 @@ function captureTerraformFromTool(
   },
   previous: Map<string, Buffer>,
 ): TerraformArtifact[] {
-  const args = isRecord(event.args) ? event.args : {};
-  const result = isRecord(event.result) ? event.result : {};
+  const args = unwrapToolRecord(event.args);
+  const result = unwrapToolRecord(event.result);
   const pathRaw =
     stringField(args, ["path", "file_path", "filePath"]) ??
     stringField(result, ["path", "file_path", "filePath"]);
@@ -144,20 +154,16 @@ function captureTerraformFromTool(
   }
 
   const fullText =
-    stringField(args, ["fileText", "contents", "content"]) ??
-    stringField(result, ["fileContentAfterWrite", "contents", "content"]);
-  if (
-    typeof fullText === "string" &&
-    (event.name.toLowerCase().includes("write") ||
-      fullText.includes("\n") ||
-      previous.has(path))
-  ) {
-    if (
-      event.name.toLowerCase().includes("write") ||
-      fullText.includes("\n")
-    ) {
-      return [{ path, contents: Buffer.from(fullText) }];
-    }
+    stringField(args, ["streamContent", "fileText", "contents", "content"]) ??
+    stringField(result, [
+      "afterFullFileContent",
+      "fileContentAfterWrite",
+      "streamContent",
+      "contents",
+      "content",
+    ]);
+  if (typeof fullText === "string" && fullText.includes("\n")) {
+    return [{ path, contents: Buffer.from(fullText) }];
   }
 
   const oldString = stringField(args, [
