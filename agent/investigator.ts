@@ -3,10 +3,11 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 
 import { Agent, CursorAgentError, type Run } from "@cursor/sdk";
 
@@ -171,6 +172,273 @@ function denyMessages(result: PolicyResult): string[] {
     return [];
   }
   return result.deny.filter((item): item is string => typeof item === "string");
+}
+
+function readPlan(): Record<string, unknown> {
+  const path = join(repoRoot, "artifacts", "plan.json");
+  if (!existsSync(path)) {
+    throw new Error("artifacts/plan.json is missing");
+  }
+  const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+  if (!isRecord(parsed)) {
+    throw new Error("artifacts/plan.json must be a JSON object");
+  }
+  return parsed;
+}
+
+function resourceChanges(plan: Record<string, unknown>): Record<string, unknown>[] {
+  const changes = plan.resource_changes;
+  if (!Array.isArray(changes)) {
+    return [];
+  }
+  return changes.filter(isRecord);
+}
+
+function addressesInMessage(message: string, addresses: string[]): string[] {
+  const occupied: Array<{ start: number; end: number }> = [];
+  const matched = new Set<string>();
+  const sorted = [...addresses].sort(
+    (left, right) => right.length - left.length,
+  );
+  for (const address of sorted) {
+    let from = 0;
+    while (from < message.length) {
+      const start = message.indexOf(address, from);
+      if (start === -1) {
+        break;
+      }
+      const end = start + address.length;
+      const covered = occupied.some(
+        (span) => start >= span.start && end <= span.end,
+      );
+      if (!covered) {
+        occupied.push({ start, end });
+        matched.add(address);
+      }
+      from = start + 1;
+    }
+  }
+  return [...matched];
+}
+
+function deniedResourceChanges(
+  plan: Record<string, unknown>,
+  denies: string[],
+): Record<string, unknown>[] {
+  const changes = resourceChanges(plan);
+  const addresses = changes
+    .map((change) => change.address)
+    .filter(
+      (address): address is string =>
+        typeof address === "string" && address !== "",
+    );
+  const kept = denies.filter(
+    (message) => addressesInMessage(message, addresses).length > 0,
+  );
+  if (kept.length === 0) {
+    throw new Error("investigator denial does not match a planned resource");
+  }
+  const matched = new Set(
+    kept.flatMap((message) => addressesInMessage(message, addresses)),
+  );
+  return changes.filter(
+    (change) =>
+      typeof change.address === "string" && matched.has(change.address),
+  );
+}
+
+function moduleBlockNames(moduleAddress: string): string[] | undefined {
+  const parts = moduleAddress.split(".");
+  if (parts.length === 0 || parts.length % 2 !== 0) {
+    return undefined;
+  }
+  const names: string[] = [];
+  for (let index = 0; index < parts.length; index += 2) {
+    if (parts[index] !== "module" || parts[index + 1] === "") {
+      return undefined;
+    }
+    names.push(parts[index + 1]);
+  }
+  return names;
+}
+
+function moduleCalls(
+  moduleNode: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!moduleNode) {
+    return undefined;
+  }
+  return isRecord(moduleNode.module_calls) ? moduleNode.module_calls : undefined;
+}
+
+function rootModuleCalls(
+  plan: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  if (!isRecord(plan.configuration)) {
+    return undefined;
+  }
+  const root = plan.configuration.root_module;
+  return isRecord(root) ? moduleCalls(root) : undefined;
+}
+
+function resolveModuleDirectory(
+  parentDirectory: string,
+  source: string,
+): string | undefined {
+  if (source.startsWith("/") || source.split("/").includes("..")) {
+    return undefined;
+  }
+  const base =
+    parentDirectory === "" ? repoRoot : join(repoRoot, parentDirectory);
+  const relativePath = relative(repoRoot, resolve(base, source))
+    .split(sep)
+    .join("/");
+  if (relativePath === "" || relativePath.startsWith("..")) {
+    return undefined;
+  }
+  return comparablePath(relativePath);
+}
+
+function locateModule(
+  plan: Record<string, unknown>,
+  moduleAddress: string,
+): { directory: string; source: string; blockName: string } | undefined {
+  const names = moduleBlockNames(moduleAddress);
+  if (!names) {
+    return undefined;
+  }
+  let calls = rootModuleCalls(plan);
+  let directory = "";
+  let located:
+    | { directory: string; source: string; blockName: string }
+    | undefined;
+  for (const blockName of names) {
+    const call = calls?.[blockName];
+    if (!isRecord(call) || typeof call.source !== "string" || call.source === "") {
+      return undefined;
+    }
+    const nextDirectory = resolveModuleDirectory(directory, call.source);
+    if (!nextDirectory) {
+      return undefined;
+    }
+    directory = nextDirectory;
+    located = { directory, source: call.source, blockName };
+    calls = isRecord(call.module) ? moduleCalls(call.module) : undefined;
+  }
+  return located;
+}
+
+const skippedTerraformDirectories = new Set([
+  ".git",
+  ".terraform",
+  "node_modules",
+]);
+
+function listPermittedTerraformFiles(relativeDirectory: string): string[] {
+  const absoluteDirectory =
+    relativeDirectory === "" ? repoRoot : join(repoRoot, relativeDirectory);
+  if (
+    !existsSync(absoluteDirectory) ||
+    !lstatSync(absoluteDirectory).isDirectory()
+  ) {
+    return [];
+  }
+
+  const files: string[] = [];
+  const visit = (absolute: string): void => {
+    for (const entry of readdirSync(absolute, { withFileTypes: true })) {
+      if (entry.isSymbolicLink()) {
+        continue;
+      }
+      const absolutePath = join(absolute, entry.name);
+      if (entry.isDirectory()) {
+        if (skippedTerraformDirectories.has(entry.name)) {
+          continue;
+        }
+        visit(absolutePath);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith(".tf")) {
+        continue;
+      }
+      const path = comparablePath(
+        relative(repoRoot, absolutePath).split(sep).join("/"),
+      );
+      if (!isPermittedTerraformSource(path)) {
+        continue;
+      }
+      files.push(path);
+    }
+  };
+  visit(absoluteDirectory);
+  return files;
+}
+
+function planTracedTerraformFiles(
+  plan: Record<string, unknown>,
+  denies: string[],
+): Set<string> {
+  const sources = new Map(
+    listPermittedTerraformFiles("").map((path) => [
+      path,
+      readFileSync(join(repoRoot, path), "utf8"),
+    ]),
+  );
+  const allowed = new Set<string>();
+
+  for (const change of deniedResourceChanges(plan, denies)) {
+    const moduleAddress = change.module_address;
+    if (typeof moduleAddress === "string" && moduleAddress !== "") {
+      const located = locateModule(plan, moduleAddress);
+      if (!located) {
+        continue;
+      }
+      const directoryPrefix = `${located.directory}/`;
+      for (const [path, text] of sources) {
+        if (
+          path.startsWith(directoryPrefix) ||
+          text.includes(located.source) ||
+          text.includes(located.blockName)
+        ) {
+          allowed.add(path);
+        }
+      }
+      continue;
+    }
+
+    if (typeof change.type !== "string" || typeof change.name !== "string") {
+      continue;
+    }
+    if (change.type === "" || change.name === "") {
+      continue;
+    }
+    const header = `resource "${change.type}" "${change.name}"`;
+    for (const [path, text] of sources) {
+      if (text.includes(header)) {
+        allowed.add(path);
+      }
+    }
+  }
+
+  if (allowed.size === 0) {
+    throw new Error(
+      "investigator plan trace found no Terraform files for the denial",
+    );
+  }
+  return allowed;
+}
+
+function assertPlanTracedRemediation(paths: string[]): void {
+  const allowed = planTracedTerraformFiles(
+    readPlan(),
+    denyMessages(readPolicyResult()),
+  );
+  const outside = paths.filter((path) => !allowed.has(comparablePath(path)));
+  if (outside.length > 0) {
+    throw new Error(
+      `investigator changed files outside the plan-traced Terraform files for the denial; refusing remediation PR: ${outside.join(", ")}`,
+    );
+  }
 }
 
 function buildPrompt(denies: string[]): string {
@@ -453,6 +721,7 @@ function verifyRemediationChanges(base: string, target: string): string[] {
       `investigator created symbolic links; refusing remediation PR: ${symlinks.join(", ")}`,
     );
   }
+  assertPlanTracedRemediation(paths);
   return paths;
 }
 
@@ -604,6 +873,7 @@ function verifyWorkingTreeRemediation(files: RemediationFile[]): string[] {
       `investigator changed blocked files; refusing remediation PR: ${unexpected.join(", ")}`,
     );
   }
+  assertPlanTracedRemediation(paths);
   return paths;
 }
 
