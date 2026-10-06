@@ -12,6 +12,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { Agent, CursorAgentError, type Run } from "@cursor/sdk";
 
 const repoRoot = process.cwd();
+const terraformDirectory = "terraform";
 
 type PolicyResult = {
   deny?: unknown;
@@ -148,15 +149,19 @@ function changedPaths(): string[] {
 }
 
 function isPermittedTerraformSource(path: string): boolean {
+  if (path.startsWith("/") || path.split("/").includes("..")) {
+    return false;
+  }
+
+  const normalized = comparablePath(path);
   if (
-    path.startsWith("/") ||
-    path.split("/").includes("..") ||
-    !path.endsWith(".tf")
+    !normalized.endsWith(".tf") ||
+    !normalized.startsWith(`${terraformDirectory}/`)
   ) {
     return false;
   }
 
-  const absolutePath = join(repoRoot, path);
+  const absolutePath = join(repoRoot, normalized);
   return !existsSync(absolutePath) || !lstatSync(absolutePath).isSymbolicLink();
 }
 
@@ -288,12 +293,16 @@ function resolveModuleDirectory(
   if (source.startsWith("/") || source.split("/").includes("..")) {
     return undefined;
   }
-  const base =
-    parentDirectory === "" ? repoRoot : join(repoRoot, parentDirectory);
+  const base = join(repoRoot, parentDirectory);
   const relativePath = relative(repoRoot, resolve(base, source))
     .split(sep)
     .join("/");
-  if (relativePath === "" || relativePath.startsWith("..")) {
+  if (
+    relativePath === "" ||
+    relativePath.startsWith("..") ||
+    (relativePath !== terraformDirectory &&
+      !relativePath.startsWith(`${terraformDirectory}/`))
+  ) {
     return undefined;
   }
   return comparablePath(relativePath);
@@ -308,7 +317,7 @@ function locateModule(
     return undefined;
   }
   let calls = rootModuleCalls(plan);
-  let directory = "";
+  let directory = terraformDirectory;
   let located:
     | { directory: string; source: string; blockName: string }
     | undefined;
@@ -379,7 +388,7 @@ function planTracedTerraformFiles(
   denies: string[],
 ): Set<string> {
   const sources = new Map(
-    listPermittedTerraformFiles("").map((path) => [
+    listPermittedTerraformFiles(terraformDirectory).map((path) => [
       path,
       readFileSync(join(repoRoot, path), "utf8"),
     ]),
@@ -456,6 +465,7 @@ function buildPrompt(denies: string[]): string {
     "",
     "If yes:",
     "- use Write or StrReplace to apply the smallest compliant Terraform .tf source change",
+    "- file paths in files are repository paths under terraform/, such as terraform/main.tf and terraform/modules/database/main.tf",
     "- put the same full file contents after the edit in files. contents is the complete file text, not a unified diff",
     "- you may run terraform fmt on files you change",
     "- minimize blast radius",
@@ -477,7 +487,7 @@ function buildPrompt(denies: string[]): string {
     "",
     "After any required file edits, your final message must be only one JSON object, with no Markdown fence or other text, matching exactly one of these shapes:",
     "",
-    '{"outcome":"remediation","violation":"...","rootCause":"...","filesExamined":["..."],"remediation":"...","whyThisLocation":"...","files":[{"path":"main.tf","contents":"..."}]}',
+    '{"outcome":"remediation","violation":"...","rootCause":"...","filesExamined":["..."],"remediation":"...","whyThisLocation":"...","files":[{"path":"terraform/main.tf","contents":"..."}]}',
     "",
     "or",
     "",

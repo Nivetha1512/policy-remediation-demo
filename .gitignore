@@ -5,7 +5,5 @@ node_modules/
 *.tfstate.*
 crash.log
 artifacts/plan.json
-artifacts/plan.tfplan
 artifacts/policy-result.json
-artifacts/remediation-report.txt
 .cursor/
