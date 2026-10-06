@@ -346,13 +346,6 @@ function buildPrompt(denies: string[]): string {
   ].join("\n");
 }
 
-function buildPersistPrompt(): string {
-  return [
-    "Re-apply the same smallest compliant Terraform .tf source change with Write or StrReplace, even if you believe the edit is already saved.",
-    "Copy each changed .tf file into artifacts/<repository-relative-path> so orchestration can download it.",
-  ].join("\n");
-}
-
 function assertExactKeys(
   value: Record<string, unknown>,
   expected: string[],
@@ -1173,81 +1166,6 @@ async function waitForCloudPersist(
   return { branches: [], terraformFiles: [] };
 }
 
-async function sendCloudPersistFollowUp(agent: SDKAgent): Promise<{
-  id: string;
-  git?: CloudGit;
-  status: string;
-  terraformFiles: TerraformArtifact[];
-}> {
-  const run = await agent.send(buildPersistPrompt(), { mode: "agent" });
-  console.log(`persist run.id=${run.id}`);
-  const { result, terraformFiles } = await waitForRun(run, "persist");
-  console.log(`persist run.id=${result.id} status=${result.status}`);
-  console.log(`persist run.git=${JSON.stringify(result.git ?? null)}`);
-  if (result.error) {
-    console.log(`persist run.error=${JSON.stringify(result.error)}`);
-  }
-  if (result.result) {
-    console.log(`persist run.result=${result.result}`);
-  }
-  return {
-    id: result.id,
-    git: result.git,
-    status: result.status,
-    terraformFiles,
-  };
-}
-
-async function requestCloudWorkspacePersist(
-  agent: SDKAgent,
-): Promise<CloudPersistResult> {
-  console.log(
-    "cloud investigator produced no named branch; requesting persist of the already decided Terraform edit immediately",
-  );
-  let persistRun = await sendCloudPersistFollowUp(agent);
-  if (persistRun.status !== "finished") {
-    console.log(
-      `persist follow-up did not finish: ${persistRun.status}; retrying on a resumed cloud agent`,
-    );
-    await using resumed = await Agent.resume(agent.agentId, {
-      apiKey: process.env.CURSOR_API_KEY,
-      model: { id: "composer-2.5" },
-    });
-    persistRun = await sendCloudPersistFollowUp(resumed);
-    if (persistRun.status !== "finished") {
-      console.log(
-        `persist retry did not finish: ${persistRun.status}; continuing with other cloud recovery paths`,
-      );
-    }
-    const snapshot = await waitForCloudPersist(
-      resumed,
-      persistRun.id,
-      resumed.agentId,
-      persistRun.git,
-    );
-    return {
-      branches: snapshot.branches,
-      terraformFiles: mergeTerraformFiles([
-        ...persistRun.terraformFiles,
-        ...snapshot.terraformFiles,
-      ]),
-    };
-  }
-  const snapshot = await waitForCloudPersist(
-    agent,
-    persistRun.id,
-    agent.agentId,
-    persistRun.git,
-  );
-  return {
-    branches: snapshot.branches,
-    terraformFiles: mergeTerraformFiles([
-      ...persistRun.terraformFiles,
-      ...snapshot.terraformFiles,
-    ]),
-  };
-}
-
 function applyDownloadedTerraformFiles(files: TerraformArtifact[]): void {
   if (files.length === 0) {
     throw new Error("cloud investigator produced no Terraform artifacts");
@@ -1524,19 +1442,6 @@ async function main(): Promise<void> {
       ]),
     };
     if (
-      outcome.outcome === "remediation" &&
-      persist.branches.length === 0 &&
-      persist.terraformFiles.length === 0
-    ) {
-      persist = await requestCloudWorkspacePersist(agent);
-      persist = {
-        branches: persist.branches,
-        terraformFiles: mergeTerraformFiles([
-          ...waited.terraformFiles,
-          ...persist.terraformFiles,
-        ]),
-      };
-    } else if (
       persist.branches.length === 0 &&
       persist.terraformFiles.length === 0
     ) {
