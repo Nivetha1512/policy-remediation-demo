@@ -60,11 +60,13 @@ A red `policy-check` on the broken caller is expected. That is the policy engine
 
 If and only if OPA returns a denial on an in-repository pull request, the `investigate` job starts a Cursor SDK cloud investigator from the pull-request head. Local `@cursor/sdk` execution on GitHub Actions crashes (exit 139), so CI never invokes `Agent.create` or `Agent.prompt` with a local runtime. Formatting, validation, plan, and dependency failures do not start the investigator. Heads named `cursor/*` and `policy-remediation/*` skip investigation so a remediation pull request is verified by OPA without recursively launching another investigator.
 
-The agent has no workflow GitHub token and is instructed to edit Terraform only on the platform remediation workspace. TypeScript validates its structured response. Cursor `autoCreatePR` opens the remediation pull request (PR B). Orchestration keeps that pull request, retargets its base to the developer branch when the base is not already that branch, and writes the investigator summary. It does not close that pull request or open a second one. If the cloud run returns a remediation without a pull request URL, orchestration can recover the edit from cloud artifacts or a branch scan and still open one pull request whose base is the developer branch.
+The agent has no workflow GitHub token. `autoCreatePR` is off, so Cursor does not create a branch or pull request. The agent edits Terraform in its cloud workspace with Write or StrReplace and returns one JSON object. For a remediation, `files` carries the full text of each changed `.tf` file.
 
-For a `remediation` outcome, orchestration accepts only changed `.tf` files. PR B stays on the Cursor branch. Orchestration reads its base and, when that base is not the developer branch from `github.event.pull_request.head.ref`, retargets it with `gh pr edit`. It does not push to the developer branch or `main` and never auto-merges. If blocked files changed, orchestration closes that pull request and fails. The green OPA check after a human merges the remediation pull request into the developer branch is authoritative for the original pull request.
+`investigator.ts` is the sole publisher. It writes those contents onto the developer-head checkout, runs `terraform fmt` on them, and commits only those files on `policy-remediation/<run id>-<run attempt>` from the developer head. It pushes that branch and opens one pull request whose head is that branch and whose base is the developer branch. If that head already has an open pull request, the script retargets its base to the developer branch and replaces the title and body. The script publishes only the `files` array from the investigator JSON. It does not read the tool stream, cloud artifacts, `result.git`, or a `cursor/*` branch as the remediation. An open `cursor/*` pull request based on the same developer head is closed as cleanup.
 
-For a `no_code_fix` outcome, orchestration closes an auto-created pull request when one exists, creates no remediation pull request, requires a clean working tree, creates a follow-up issue from the investigator's explanation, and comments on the original pull request.
+For a `remediation` outcome, the script publishes a diff. Those paths come from `files`, and each one must still be permitted Terraform source. The script checks that set after writing the files and before `git push`, then checks the pushed commit again before `gh pr create`. It does not push to the developer branch or `main` and never auto-merges. A missing or empty `files` array, empty contents, or a path that is not permitted Terraform source fails the run. If blocked files changed, the script refuses the remediation pull request. The green OPA check after a human merges the remediation pull request into the developer branch is authoritative for the original pull request.
+
+For a `no_code_fix` outcome, the script creates no remediation branch and no remediation pull request. It requires a clean working tree, creates one follow-up issue from the investigator's explanation, and comments once on the original pull request. It also closes a stray `cursor/*` pull request based on that head.
 
 ### Required GitHub configuration
 
@@ -74,14 +76,14 @@ For a `no_code_fix` outcome, orchestration closes an auto-created pull request w
 
 Create the key at [Cursor Dashboard → Integrations](https://cursor.com/dashboard/integrations) or in team service-account settings. Add it as a repository secret named `CURSOR_API_KEY`. Do not commit the value.
 
-GitHub's automatic `GITHUB_TOKEN` is used only after investigation to retarget the auto-created remediation pull request and write its summary, to open one fallback pull request when Cursor did not return a pull request URL, or to create and link a follow-up issue. Fork pull requests are skipped because an upstream remediation pull request cannot target a branch that exists only in a fork.
+GitHub's automatic `GITHUB_TOKEN` is used only after investigation to commit and push the remediation branch, open or retarget that pull request, or create and link a follow-up issue. Fork pull requests are skipped because an upstream remediation pull request cannot target a branch that exists only in a fork.
 
 ### Demo sequence
 
 1. Keep the original caller in the broken state, or run `./scripts/reset-demo.sh`.
 2. Open a pull request from a developer branch to `main`.
 3. Watch `policy-check` fail on the OPA denial.
-4. If the result is `remediation`, review and merge the Cursor remediation pull request into the developer branch.
+4. If the result is `remediation`, review and merge the remediation pull request into the developer branch.
 5. The new commit on the developer branch reruns the original pull request's fmt, validate, plan, and OPA checks.
 6. If the result is `no_code_fix`, use the linked issue to supply the required decision, exception, or external dependency. The original pull request remains blocked.
 

@@ -3,29 +3,23 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import {
-  Agent,
-  CursorAgentError,
-  JsonlLocalAgentStore,
-  type Run,
-  type SDKAgent,
-  type SDKArtifact,
-} from "@cursor/sdk";
+import { Agent, CursorAgentError, type Run } from "@cursor/sdk";
 
 const repoRoot = process.cwd();
-const CLOUD_PERSIST_ATTEMPTS = 8;
-const CLOUD_PERSIST_DELAY_MS = 5000;
 
 type PolicyResult = {
   deny?: unknown;
   pass?: unknown;
+};
+
+type RemediationFile = {
+  path: string;
+  contents: string;
 };
 
 type RemediationOutcome = {
@@ -35,6 +29,7 @@ type RemediationOutcome = {
   filesExamined: string[];
   remediation: string;
   whyThisLocation: string;
+  files: RemediationFile[];
 };
 
 type NoCodeFixOutcome = {
@@ -54,31 +49,8 @@ type PullRequestContext = {
   url: string;
 };
 
-type CloudBranch = {
-  branch: string;
-  prUrl?: string;
-};
-
-type CloudGit = {
-  branches?: Array<{ branch?: string; prUrl?: string }>;
-};
-
-type TerraformArtifact = {
-  path: string;
-  contents: Buffer;
-};
-
-type CloudPersistResult = {
-  branches: CloudBranch[];
-  terraformFiles: TerraformArtifact[];
-};
-
 function runningOnGitHubActions(): boolean {
   return process.env.GITHUB_ACTIONS === "true";
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function errorMessage(error: unknown): string {
@@ -89,110 +61,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function stringField(
-  value: Record<string, unknown>,
-  keys: string[],
-): string | undefined {
-  for (const key of keys) {
-    const field = value[key];
-    if (typeof field === "string" && field !== "") {
-      return field;
-    }
+function assertLocalSdkBlocked(options: {
+  cloud?: unknown;
+  local?: unknown;
+}): void {
+  if (runningOnGitHubActions() && options.local !== undefined) {
+    throw new Error(
+      "local Cursor SDK runtime is not invoked on GitHub Actions",
+    );
   }
-  return undefined;
-}
-
-function workspaceTerraformPath(raw: string): string | undefined {
-  let relative = raw.replace(/^\/+/, "");
-  relative = relative.replace(/^workspace\//, "");
-  if (relative.startsWith("artifacts/")) {
-    relative = relative.slice("artifacts/".length);
-  }
-  relative = relative.replace(/^workspace\//, "");
-  return isPermittedTerraformSource(relative) ? relative : undefined;
-}
-
-function mergeTerraformFiles(files: TerraformArtifact[]): TerraformArtifact[] {
-  const byPath = new Map<string, Buffer>();
-  for (const file of files) {
-    byPath.set(file.path, file.contents);
-  }
-  return [...byPath.entries()].map(([path, contents]) => ({ path, contents }));
-}
-
-function unwrapToolRecord(value: unknown): Record<string, unknown> {
-  if (!isRecord(value)) {
-    return {};
-  }
-  if (isRecord(value.success)) {
-    return { ...value, ...value.success };
-  }
-  return value;
-}
-
-function captureTerraformFromTool(
-  event: {
-    name: string;
-    args?: unknown;
-    result?: unknown;
-  },
-  previous: Map<string, Buffer>,
-): TerraformArtifact[] {
-  const args = unwrapToolRecord(event.args);
-  const result = unwrapToolRecord(event.result);
-  const pathRaw =
-    stringField(args, ["path", "file_path", "filePath"]) ??
-    stringField(result, ["path", "file_path", "filePath"]);
-  if (!pathRaw) {
-    return [];
-  }
-  const path = workspaceTerraformPath(pathRaw);
-  if (!path) {
-    return [];
-  }
-
-  const fullText =
-    stringField(result, [
-      "afterFullFileContent",
-      "fileContentAfterWrite",
-      "streamContent",
-      "contents",
-      "content",
-    ]) ??
-    stringField(args, ["streamContent", "fileText", "contents", "content"]);
-  if (typeof fullText === "string" && fullText.includes("\n")) {
-    return [{ path, contents: Buffer.from(fullText) }];
-  }
-
-  const oldString = stringField(args, ["old_string", "oldString", "old_str"]);
-  const newString = stringField(args, ["new_string", "newString", "new_str"]);
-  if (oldString !== undefined && newString !== undefined) {
-    const base = previous.get(path)
-      ? previous.get(path)!.toString("utf8")
-      : existsSync(join(repoRoot, path))
-        ? readFileSync(join(repoRoot, path), "utf8")
-        : undefined;
-    if (base === undefined || !base.includes(oldString)) {
-      console.log(`cloud edit old_string not found in ${path}`);
-      return [];
-    }
-    return [
-      { path, contents: Buffer.from(base.replace(oldString, newString)) },
-    ];
-  }
-
-  return [];
 }
 
 async function waitForRun(
   run: Run,
   label: string,
-): Promise<{
-  result: Awaited<ReturnType<Run["wait"]>>;
-  terraformFiles: TerraformArtifact[];
-}> {
+): Promise<Awaited<ReturnType<Run["wait"]>>> {
   const tools: string[] = [];
-  const captured = new Map<string, Buffer>();
   const stream = run.supports("stream")
     ? (async () => {
         for await (const event of run.stream()) {
@@ -201,23 +85,6 @@ async function waitForRun(
           }
           console.log(`${label} tool ${event.name} ${event.status}`);
           tools.push(`${event.name}:${event.status}`);
-          if (
-            /edit|write|replace/i.test(event.name) &&
-            (event.status === "completed" || event.status === "running")
-          ) {
-            console.log(
-              `${label} ${event.name} args=${JSON.stringify(event.args ?? null).slice(0, 4000)}`,
-            );
-            if (event.result !== undefined) {
-              console.log(
-                `${label} ${event.name} result=${JSON.stringify(event.result).slice(0, 4000)}`,
-              );
-            }
-            for (const file of captureTerraformFromTool(event, captured)) {
-              captured.set(file.path, file.contents);
-              console.log(`captured cloud terraform edit ${file.path}`);
-            }
-          }
         }
       })().catch((error: unknown) => {
         console.log(`${label} stream ended: ${errorMessage(error)}`);
@@ -228,13 +95,7 @@ async function waitForRun(
   console.log(
     `${label} tools=${tools.length > 0 ? tools.join(",") : "(none)"}`,
   );
-  return {
-    result,
-    terraformFiles: [...captured.entries()].map(([path, contents]) => ({
-      path,
-      contents,
-    })),
-  };
+  return result;
 }
 
 function runGit(
@@ -279,7 +140,9 @@ function changedPaths(): string[] {
   ];
 
   return [
-    ...new Set(outputs.flatMap((output) => output.split("\0").filter(Boolean))),
+    ...new Set(
+      outputs.flatMap((output) => output.split("\0").filter(Boolean)),
+    ),
   ].sort();
 }
 
@@ -294,6 +157,13 @@ function isPermittedTerraformSource(path: string): boolean {
 
   const absolutePath = join(repoRoot, path);
   return !existsSync(absolutePath) || !lstatSync(absolutePath).isSymbolicLink();
+}
+
+function comparablePath(path: string): string {
+  return path
+    .split("/")
+    .filter((part) => part !== "." && part !== "")
+    .join("/");
 }
 
 function denyMessages(result: PolicyResult): string[] {
@@ -317,8 +187,9 @@ function buildPrompt(denies: string[]): string {
     "Determine whether a safe compliant code remediation can be made using only the repository and available plan/policy context.",
     "",
     "If yes:",
-    "- use file edit tools (Write or StrReplace) to apply the smallest compliant Terraform .tf source change",
-    "- copy each changed .tf file into artifacts/ using the same repository-relative path",
+    "- use Write or StrReplace to apply the smallest compliant Terraform .tf source change",
+    "- put the same full file contents after the edit in files. contents is the complete file text, not a unified diff",
+    "- you may run terraform fmt on files you change",
     "- minimize blast radius",
     "- do not modify policy",
     '- return outcome="remediation"',
@@ -330,15 +201,15 @@ function buildPrompt(denies: string[]): string {
     "- do not edit source files",
     '- return outcome="no_code_fix"',
     "- explain what information, exception, ownership decision, or external dependency is required",
+    "- do not include a files field",
     "",
-    "When the platform provides a remediation branch or workspace, make changes only there.",
-    "Never push changes to the developer branch or main.",
-    "Do not create GitHub issues or post GitHub comments. Deterministic orchestration handles those operations.",
-    "Do not create additional branches or pull requests outside the platform-provided remediation flow.",
+    "Do not open branches, pull requests, issues, or comments.",
+    "Do not push to the developer branch or main.",
+    "The remediation pull request OPA check is the validation, not this agent turn.",
     "",
     "After any required file edits, your final message must be only one JSON object, with no Markdown fence or other text, matching exactly one of these shapes:",
     "",
-    '{"outcome":"remediation","violation":"...","rootCause":"...","filesExamined":["..."],"remediation":"...","whyThisLocation":"..."}',
+    '{"outcome":"remediation","violation":"...","rootCause":"...","filesExamined":["..."],"remediation":"...","whyThisLocation":"...","files":[{"path":"main.tf","contents":"..."}]}',
     "",
     "or",
     "",
@@ -370,6 +241,42 @@ function requireString(value: Record<string, unknown>, key: string): string {
   return field.trim();
 }
 
+function parseRemediationFiles(value: unknown): RemediationFile[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(
+      'investigator result field "files" must be a non-empty array',
+    );
+  }
+
+  const seen = new Set<string>();
+  return value.map((item) => {
+    if (!isRecord(item)) {
+      throw new Error(
+        'investigator result field "files" entries must be objects',
+      );
+    }
+    assertExactKeys(item, ["path", "contents"]);
+    const path = requireString(item, "path");
+    const contents = item.contents;
+    if (typeof contents !== "string" || contents.trim() === "") {
+      throw new Error(
+        'investigator result field "files" contents must be non-empty',
+      );
+    }
+    if (!isPermittedTerraformSource(path)) {
+      throw new Error(
+        `investigator remediation path is not permitted Terraform source: ${path}`,
+      );
+    }
+    const key = comparablePath(path);
+    if (seen.has(key)) {
+      throw new Error(`investigator remediation path is duplicated: ${path}`);
+    }
+    seen.add(key);
+    return { path, contents };
+  });
+}
+
 function parseOutcome(text: string): InvestigatorOutcome {
   const trimmed = text.trim();
   const fenced = trimmed.match(/^```(?:json)?\s*\n([\s\S]*?)\n```$/);
@@ -395,6 +302,7 @@ function parseOutcome(text: string): InvestigatorOutcome {
       "filesExamined",
       "remediation",
       "whyThisLocation",
+      "files",
     ]);
     if (
       !Array.isArray(value.filesExamined) ||
@@ -414,6 +322,7 @@ function parseOutcome(text: string): InvestigatorOutcome {
       filesExamined: value.filesExamined.map((item) => (item as string).trim()),
       remediation: requireString(value, "remediation"),
       whyThisLocation: requireString(value, "whyThisLocation"),
+      files: parseRemediationFiles(value.files),
     };
   }
 
@@ -653,154 +562,32 @@ function editRemediationPullRequest(
 function retargetAndKeepRemediationPr(
   outcome: RemediationOutcome,
   context: PullRequestContext,
-  cloud: CloudBranch,
+  branch: string,
+  prUrl: string,
 ): void {
-  if (!cloud.prUrl) {
-    throw new Error("auto-created remediation pull request URL is missing");
-  }
-
-  runGh(["auth", "setup-git"]);
   try {
     assertDeveloperHeadUnchanged(context);
-    verifiedCloudCommit(context, cloud.branch);
+    verifiedCloudCommit(context, branch);
   } catch (error) {
-    closePullRequestBestEffort(cloud.prUrl);
+    closePullRequestBestEffort(prUrl);
     throw error;
   }
 
-  const base = pullRequestBase(cloud.prUrl);
+  const base = pullRequestBase(prUrl);
   if (base === context.branchA) {
     console.log(`keeping remediation PR base ${base}`);
-    editRemediationPullRequest(cloud.prUrl, outcome);
+    editRemediationPullRequest(prUrl, outcome);
   } else {
     console.log(
       `retargeting remediation PR base from ${base} to ${context.branchA}`,
     );
-    editRemediationPullRequest(cloud.prUrl, outcome, context.branchA);
+    editRemediationPullRequest(prUrl, outcome, context.branchA);
   }
-  console.log(`remediation PR: ${cloud.prUrl}`);
-}
-
-function createPullRequestOnBranch(
-  outcome: RemediationOutcome,
-  context: PullRequestContext,
-  branch: string,
-): void {
-  runGh(["auth", "setup-git"]);
-  assertDeveloperHeadUnchanged(context);
-  verifiedCloudCommit(context, branch);
-
-  const existing = openPullRequestsByHead().get(branch);
-  if (existing) {
-    retargetAndKeepRemediationPr(outcome, context, {
-      branch,
-      prUrl: existing,
-    });
-    return;
-  }
-
-  const prUrl = runGh([
-    "pr",
-    "create",
-    "--repo",
-    githubRepository(),
-    "--head",
-    branch,
-    "--base",
-    context.branchA,
-    "--title",
-    "Remediate Terraform policy denial",
-    "--body",
-    buildPrBody(outcome),
-  ]);
   console.log(`remediation PR: ${prUrl}`);
 }
 
-function createRemediationPrFromCloudCommit(
-  outcome: RemediationOutcome,
-  context: PullRequestContext,
-  cloud: CloudBranch,
-): void {
-  const branchB = remediationBranchName();
-
-  runGh(["auth", "setup-git"]);
-  assertDeveloperHeadUnchanged(context);
-  const cloudCommit = verifiedCloudCommit(context, cloud.branch);
-
-  runGit(["branch", branchB, cloudCommit]);
-  runGit(["push", "-u", "origin", branchB]);
-  if (
-    cloud.branch !== branchB &&
-    !cloud.branch.startsWith("cursor/") &&
-    !protectedBranch(cloud.branch, context.branchA)
-  ) {
-    runGit(["push", "origin", "--delete", cloud.branch]);
-  }
-
-  const existing = openPullRequestsByHead().get(branchB);
-  if (existing) {
-    retargetAndKeepRemediationPr(outcome, context, {
-      branch: branchB,
-      prUrl: existing,
-    });
-    return;
-  }
-
-  const prUrl = runGh([
-    "pr",
-    "create",
-    "--repo",
-    githubRepository(),
-    "--head",
-    branchB,
-    "--base",
-    context.branchA,
-    "--title",
-    "Remediate Terraform policy denial",
-    "--body",
-    buildPrBody(outcome),
-  ]);
-  console.log(`remediation PR: ${prUrl}`);
-}
-
-function protectedBranch(branch: string, branchA: string): boolean {
-  return branch === "main" || branch === branchA || branch.startsWith("demo/");
-}
-
-function publishCloudRemediation(
-  outcome: RemediationOutcome,
-  context: PullRequestContext,
-  cloud: CloudBranch,
-  source: "sdk" | "discovered",
-): void {
-  runGh(["auth", "setup-git"]);
-  const openPr = openPullRequestsByHead().get(cloud.branch);
-  const keepUrl = cloud.branch.startsWith("cursor/")
-    ? (cloud.prUrl ?? openPr)
-    : source === "sdk"
-      ? cloud.prUrl
-      : undefined;
-  if (keepUrl) {
-    retargetAndKeepRemediationPr(outcome, context, {
-      branch: cloud.branch,
-      prUrl: keepUrl,
-    });
-    return;
-  }
-  if (
-    cloud.branch.startsWith("cursor/") ||
-    cloud.branch.startsWith("policy-remediation/")
-  ) {
-    createPullRequestOnBranch(outcome, context, cloud.branch);
-    return;
-  }
-  if (openPr) {
-    closePullRequestBestEffort(openPr);
-  }
-  createRemediationPrFromCloudCommit(outcome, context, cloud);
-}
-
-function verifyWorkingTreeRemediation(): string[] {
+function verifyWorkingTreeRemediation(files: RemediationFile[]): string[] {
+  const allowed = new Set(files.map((file) => comparablePath(file.path)));
   const paths = changedPaths();
   if (paths.length === 0) {
     throw new Error("investigator produced no Terraform remediation");
@@ -811,14 +598,48 @@ function verifyWorkingTreeRemediation(): string[] {
       `investigator changed blocked files; refusing remediation PR: ${blocked.join(", ")}`,
     );
   }
+  const unexpected = paths.filter((path) => !allowed.has(comparablePath(path)));
+  if (unexpected.length > 0) {
+    throw new Error(
+      `investigator changed blocked files; refusing remediation PR: ${unexpected.join(", ")}`,
+    );
+  }
   return paths;
+}
+
+function writeRemediationFiles(files: RemediationFile[]): void {
+  if (files.length === 0) {
+    throw new Error(
+      'investigator result field "files" must be a non-empty array',
+    );
+  }
+  for (const file of files) {
+    if (file.contents.trim() === "") {
+      throw new Error(
+        'investigator result field "files" contents must be non-empty',
+      );
+    }
+    if (!isPermittedTerraformSource(file.path)) {
+      throw new Error(
+        `investigator remediation path is not permitted Terraform source: ${file.path}`,
+      );
+    }
+    const absolutePath = join(repoRoot, file.path);
+    mkdirSync(dirname(absolutePath), { recursive: true });
+    writeFileSync(absolutePath, file.contents);
+    console.log(`wrote remediation file ${file.path}`);
+  }
+  execFileSync("terraform", ["fmt", "--", ...files.map((file) => file.path)], {
+    cwd: repoRoot,
+    stdio: "inherit",
+    env: process.env,
+  });
 }
 
 function createRemediationPrFromWorkingTree(
   outcome: RemediationOutcome,
   context: PullRequestContext,
 ): void {
-  const remediations = verifyWorkingTreeRemediation();
   const branchB = remediationBranchName();
 
   runGh(["auth", "setup-git"]);
@@ -826,6 +647,10 @@ function createRemediationPrFromWorkingTree(
   if (runGit(["rev-parse", "HEAD"]) !== context.headSha) {
     throw new Error("checkout does not match the pull request head SHA");
   }
+  closeCursorPullRequests(context);
+
+  writeRemediationFiles(outcome.files);
+  const remediations = verifyWorkingTreeRemediation(outcome.files);
 
   runGit(["checkout", "-b", branchB]);
   runGit(["add", "--", ...remediations]);
@@ -848,13 +673,12 @@ function createRemediationPrFromWorkingTree(
 
   const existing = openPullRequestsByHead().get(branchB);
   if (existing) {
-    retargetAndKeepRemediationPr(outcome, context, {
-      branch: branchB,
-      prUrl: existing,
-    });
+    retargetAndKeepRemediationPr(outcome, context, branchB, existing);
     return;
   }
 
+  assertDeveloperHeadUnchanged(context);
+  verifiedCloudCommit(context, branchB);
   const prUrl = runGh([
     "pr",
     "create",
@@ -872,125 +696,57 @@ function createRemediationPrFromWorkingTree(
   console.log(`remediation PR: ${prUrl}`);
 }
 
-async function applyLocalRemediation(prompt: string): Promise<void> {
-  if (runningOnGitHubActions()) {
-    throw new Error(
-      "local Cursor SDK runtime is not invoked on GitHub Actions",
-    );
-  }
-
-  const restoreGithubCredentials = hideGithubCredentials();
-  try {
-    const store = new JsonlLocalAgentStore(
-      mkdtempSync(join(tmpdir(), "cursor-agent-")),
-    );
-    const result = await Agent.prompt(prompt, {
-      apiKey: process.env.CURSOR_API_KEY,
-      model: { id: "composer-2.5" },
-      local: {
-        cwd: repoRoot,
-        store,
-      },
-    });
-    console.log(`local run.id=${result.id} status=${result.status}`);
-    if (result.status !== "finished") {
-      throw new Error(`local investigator did not finish: ${result.status}`);
-    }
-    if (result.result) {
-      console.log(`local run.result=${result.result}`);
-    }
-  } finally {
-    restoreGithubCredentials();
-  }
+function openPullRequestsByHead(): Map<string, string> {
+  const raw = runGh([
+    "pr",
+    "list",
+    "--repo",
+    githubRepository(),
+    "--state",
+    "open",
+    "--limit",
+    "100",
+    "--json",
+    "url,headRefName",
+  ]);
+  const prs = JSON.parse(raw) as Array<{ url: string; headRefName: string }>;
+  return new Map(prs.map((pr) => [pr.headRefName, pr.url]));
 }
 
-function dedupeCloudBranches(branches: CloudBranch[]): CloudBranch[] {
-  const byBranch = new Map<string, CloudBranch>();
-  for (const branch of branches) {
-    const existing = byBranch.get(branch.branch);
-    if (!existing || (!existing.prUrl && branch.prUrl)) {
-      byBranch.set(branch.branch, branch);
-    }
-  }
-  return [...byBranch.values()];
-}
-
-function autoCreatedPullRequests(
-  context: PullRequestContext,
-  openPrs: Map<string, string> = openPullRequestsByHead(),
-): CloudBranch[] {
-  const matches: CloudBranch[] = [];
-  for (const [branch, prUrl] of openPrs) {
+function closeCursorPullRequests(context: PullRequestContext): void {
+  for (const [branch, prUrl] of openPullRequestsByHead()) {
     if (!branch.startsWith("cursor/")) {
       continue;
     }
     try {
       const cloudCommit = fetchCloudBranch(branch);
       if (
-        runGit(["merge-base", context.headSha, cloudCommit]) !== context.headSha
+        runGit(["merge-base", context.headSha, cloudCommit]) !==
+        context.headSha
       ) {
         continue;
       }
-      matches.push({ branch, prUrl });
     } catch (error) {
       console.log(
         `skipping cursor pull request ${branch}: ${errorMessage(error)}`,
       );
+      continue;
     }
+    closePullRequestBestEffort(prUrl);
   }
-  return matches;
 }
 
 function createNoCodeFixIssue(
   outcome: NoCodeFixOutcome,
   context: PullRequestContext,
-  cloudBranches: CloudBranch[],
 ): void {
   runGh(["auth", "setup-git"]);
-  const openPrs = openPullRequestsByHead();
-  const branches = dedupeCloudBranches([
-    ...cloudBranches.map((cloud) => ({
-      branch: cloud.branch,
-      prUrl: cloud.prUrl ?? openPrs.get(cloud.branch),
-    })),
-    ...autoCreatedPullRequests(context, openPrs),
-  ]);
-  const changed: string[] = [];
-  const inspections: string[] = [];
-  const localPaths = changedPaths();
-  if (localPaths.length > 0) {
-    changed.push(...localPaths);
-  }
+  closeCursorPullRequests(context);
 
-  for (const cloud of branches) {
-    let remotePaths: string[] = [];
-    let fetched = false;
-    try {
-      const cloudCommit = fetchCloudBranch(cloud.branch);
-      fetched = true;
-      remotePaths = remoteChangedPaths(context.headSha, cloudCommit);
-    } catch (error) {
-      inspections.push(`${cloud.branch}: ${errorMessage(error)}`);
-    }
-    if (cloud.prUrl) {
-      closePullRequestBestEffort(cloud.prUrl);
-    }
-    if (remotePaths.length > 0) {
-      changed.push(...remotePaths.map((path) => `${cloud.branch}:${path}`));
-      continue;
-    }
-    if (fetched && !protectedBranch(cloud.branch, context.branchA)) {
-      runGit(["push", "origin", "--delete", cloud.branch]);
-    }
-  }
+  const changed = changedPaths();
   if (changed.length > 0) {
     throw new Error(
       `no_code_fix outcome changed files; refusing issue creation: ${changed.join(", ")}`,
-    );
-  }
-  if (inspections.length > 0) {
-    throw new Error(
-      `no_code_fix outcome could not be checked; refusing issue creation: ${inspections.join(", ")}`,
     );
   }
 
@@ -1019,7 +775,7 @@ function createNoCodeFixIssue(
     "issue",
     "create",
     "--repo",
-    process.env.GITHUB_REPOSITORY!,
+    githubRepository(),
     "--title",
     `Policy remediation requires human input: ${outcome.violation}`.slice(
       0,
@@ -1038,7 +794,7 @@ function createNoCodeFixIssue(
     "comment",
     context.number,
     "--repo",
-    process.env.GITHUB_REPOSITORY!,
+    githubRepository(),
     "--body",
     [
       "Policy remediation could not be safely generated.",
@@ -1049,236 +805,6 @@ function createNoCodeFixIssue(
     ].join("\n"),
   ]);
   console.log(`follow-up issue: ${issueUrl}`);
-}
-
-function extractCloudBranches(git: CloudGit | undefined): CloudBranch[] {
-  return (
-    git?.branches
-      ?.filter(
-        (branch): branch is typeof branch & { branch: string } =>
-          typeof branch.branch === "string" && branch.branch !== "",
-      )
-      .map((branch) => ({ branch: branch.branch, prUrl: branch.prUrl })) ?? []
-  );
-}
-
-function terraformPathFromArtifact(artifactPath: string): string | undefined {
-  let relative = artifactPath.replace(/^\/+/, "");
-  relative = relative.replace(/^workspace\//, "");
-  if (relative.startsWith("artifacts/")) {
-    relative = relative.slice("artifacts/".length);
-  }
-  relative = relative.replace(/^workspace\//, "");
-  if (!isPermittedTerraformSource(relative)) {
-    return undefined;
-  }
-  return relative;
-}
-
-async function downloadTerraformArtifacts(
-  agent: SDKAgent,
-): Promise<TerraformArtifact[]> {
-  let artifacts: SDKArtifact[] = [];
-  try {
-    artifacts = await agent.listArtifacts();
-  } catch (error) {
-    console.log(`listArtifacts failed: ${errorMessage(error)}`);
-    return [];
-  }
-  console.log(`cloud artifacts: ${JSON.stringify(artifacts)}`);
-
-  const files: TerraformArtifact[] = [];
-  for (const artifact of artifacts) {
-    const path = terraformPathFromArtifact(artifact.path);
-    if (!path) {
-      continue;
-    }
-    try {
-      files.push({
-        path,
-        contents: await agent.downloadArtifact(artifact.path),
-      });
-    } catch (error) {
-      console.log(
-        `downloadArtifact failed for ${artifact.path}: ${errorMessage(error)}`,
-      );
-    }
-  }
-  return files;
-}
-
-async function snapshotCloudPersist(
-  agent: SDKAgent,
-  runId: string,
-  agentId: string,
-  resultGit?: CloudGit,
-): Promise<CloudPersistResult> {
-  const terraformFiles = await downloadTerraformArtifacts(agent);
-  const immediate = extractCloudBranches(resultGit);
-  if (immediate.length > 0) {
-    return { branches: immediate, terraformFiles };
-  }
-
-  try {
-    const run = await Agent.getRun(runId, {
-      runtime: "cloud",
-      agentId,
-      apiKey: process.env.CURSOR_API_KEY,
-    });
-    console.log(`cloud git snapshot: ${JSON.stringify(run.git ?? null)}`);
-    return {
-      branches: extractCloudBranches(run.git),
-      terraformFiles,
-    };
-  } catch (error) {
-    console.log(`Agent.getRun failed: ${errorMessage(error)}`);
-    return { branches: [], terraformFiles };
-  }
-}
-
-async function waitForCloudPersist(
-  agent: SDKAgent,
-  runId: string,
-  agentId: string,
-  resultGit?: CloudGit,
-): Promise<CloudPersistResult> {
-  const immediate = await snapshotCloudPersist(
-    agent,
-    runId,
-    agentId,
-    resultGit,
-  );
-  if (immediate.branches.length > 0 || immediate.terraformFiles.length > 0) {
-    return immediate;
-  }
-
-  for (let attempt = 1; attempt <= CLOUD_PERSIST_ATTEMPTS; attempt += 1) {
-    await sleep(CLOUD_PERSIST_DELAY_MS);
-    const snapshot = await snapshotCloudPersist(agent, runId, agentId);
-    console.log(
-      `cloud persist poll ${attempt}: branches=${JSON.stringify(snapshot.branches)} files=${snapshot.terraformFiles.map((file) => file.path).join(",") || "(none)"}`,
-    );
-    if (snapshot.branches.length > 0 || snapshot.terraformFiles.length > 0) {
-      return snapshot;
-    }
-  }
-
-  return { branches: [], terraformFiles: [] };
-}
-
-function applyDownloadedTerraformFiles(files: TerraformArtifact[]): void {
-  if (files.length === 0) {
-    throw new Error("cloud investigator produced no Terraform artifacts");
-  }
-  for (const file of files) {
-    if (!isPermittedTerraformSource(file.path)) {
-      throw new Error(
-        `investigator artifact is not permitted Terraform source: ${file.path}`,
-      );
-    }
-    const absolutePath = join(repoRoot, file.path);
-    mkdirSync(dirname(absolutePath), { recursive: true });
-    writeFileSync(absolutePath, file.contents);
-    console.log(`copied cloud artifact to ${file.path}`);
-  }
-  try {
-    execFileSync(
-      "terraform",
-      ["fmt", "--", ...files.map((file) => file.path)],
-      { cwd: repoRoot, stdio: "inherit", env: process.env },
-    );
-  } catch (error) {
-    console.log(`terraform fmt skipped: ${errorMessage(error)}`);
-  }
-}
-
-function reservedBranch(branch: string, branchA: string): boolean {
-  return (
-    branch === "main" ||
-    branch === branchA ||
-    branch.startsWith("demo/") ||
-    branch.startsWith("policy-remediation/")
-  );
-}
-
-function openPullRequestsByHead(): Map<string, string> {
-  const raw = runGh([
-    "pr",
-    "list",
-    "--repo",
-    process.env.GITHUB_REPOSITORY!,
-    "--state",
-    "open",
-    "--limit",
-    "100",
-    "--json",
-    "url,headRefName",
-  ]);
-  const prs = JSON.parse(raw) as Array<{ url: string; headRefName: string }>;
-  return new Map(prs.map((pr) => [pr.headRefName, pr.url]));
-}
-
-function remoteHeadNames(): string[] {
-  const output = runGit(["ls-remote", "--heads", "origin"]);
-  return output
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => line.split("\t")[1]?.replace(/^refs\/heads\//, ""))
-    .filter((branch): branch is string => Boolean(branch));
-}
-
-function findPersistedCloudRemediation(
-  context: PullRequestContext,
-): CloudBranch[] {
-  runGh(["auth", "setup-git"]);
-  const prByHead = openPullRequestsByHead();
-  const heads = [...new Set([...prByHead.keys(), ...remoteHeadNames()])].filter(
-    (branch) => !reservedBranch(branch, context.branchA),
-  );
-  const preferred = heads.filter((branch) => branch.startsWith("cursor/"));
-  const candidates = preferred.length > 0 ? preferred : heads;
-  console.log(
-    `scanning ${candidates.length} candidate branches for persisted cloud remediation`,
-  );
-  const matches: CloudBranch[] = [];
-
-  for (const branch of candidates) {
-    let cloudCommit: string;
-    try {
-      cloudCommit = fetchCloudBranch(branch);
-    } catch (error) {
-      console.log(
-        `skipping candidate branch ${branch}: ${errorMessage(error)}`,
-      );
-      continue;
-    }
-    if (
-      runGit(["merge-base", context.headSha, cloudCommit]) !== context.headSha
-    ) {
-      continue;
-    }
-
-    try {
-      verifyRemediationChanges(context.headSha, cloudCommit);
-    } catch (error) {
-      const prUrl = prByHead.get(branch);
-      const message = errorMessage(error);
-      const cursorPullRequest = branch.startsWith("cursor/") && prUrl;
-      if (cursorPullRequest && /blocked files|symbolic links/.test(message)) {
-        closePullRequestBestEffort(prUrl);
-        throw error;
-      }
-      if (cursorPullRequest && message.includes("no Terraform remediation")) {
-        closePullRequestBestEffort(prUrl);
-        console.log(`closed empty auto-created pull request ${prUrl}`);
-        continue;
-      }
-      console.log(`skipping candidate branch ${branch}: ${message}`);
-      continue;
-    }
-    matches.push({ branch, prUrl: prByHead.get(branch) });
-  }
-  return matches;
 }
 
 function hideGithubCredentials(): () => void {
@@ -1296,59 +822,6 @@ function hideGithubCredentials(): () => void {
       process.env.GITHUB_TOKEN = saved.GITHUB_TOKEN;
     }
   };
-}
-
-async function openRemediationPullRequest(
-  outcome: RemediationOutcome,
-  context: PullRequestContext,
-  persist: CloudPersistResult,
-  prompt: string,
-): Promise<void> {
-  if (persist.branches.length > 1) {
-    throw new Error(
-      `remediation outcome requires exactly one investigator branch; found ${persist.branches.length}`,
-    );
-  }
-  if (persist.branches.length === 1) {
-    publishCloudRemediation(outcome, context, persist.branches[0], "sdk");
-    return;
-  }
-
-  const discovered = findPersistedCloudRemediation(context);
-  if (discovered.length > 1) {
-    throw new Error(
-      `remediation outcome requires exactly one investigator branch; found ${discovered.length}`,
-    );
-  }
-  if (discovered.length === 1) {
-    console.log(
-      `found persisted cloud branch ${discovered[0].branch} without SDK branch name`,
-    );
-    publishCloudRemediation(outcome, context, discovered[0], "discovered");
-    return;
-  }
-
-  if (persist.terraformFiles.length > 0) {
-    console.log(
-      "cloud investigator persisted Terraform artifacts; copying them into the checkout",
-    );
-    applyDownloadedTerraformFiles(persist.terraformFiles);
-    createRemediationPrFromWorkingTree(outcome, context);
-    return;
-  }
-
-  if (!runningOnGitHubActions()) {
-    console.log(
-      "cloud investigator produced no persisted branch; applying a local workspace edit",
-    );
-    await applyLocalRemediation(prompt);
-    createRemediationPrFromWorkingTree(outcome, context);
-    return;
-  }
-
-  throw new Error(
-    "cloud investigator produced a remediation but no named branch, Terraform artifacts, or Cursor pull request",
-  );
 }
 
 async function main(): Promise<void> {
@@ -1382,14 +855,12 @@ async function main(): Promise<void> {
   const denies = denyMessages(policyResult);
   const prompt = buildPrompt(denies);
 
-  let result;
   let outcome: InvestigatorOutcome | undefined;
-  let persist: CloudPersistResult = { branches: [], terraformFiles: [] };
   const restoreGithubCredentials = hideGithubCredentials();
   try {
     const repository = process.env.GITHUB_REPOSITORY!;
     const server = process.env.GITHUB_SERVER_URL ?? "https://github.com";
-    await using agent = await Agent.create({
+    const agentOptions = {
       apiKey: process.env.CURSOR_API_KEY,
       model: { id: "composer-2.5" },
       cloud: {
@@ -1400,17 +871,17 @@ async function main(): Promise<void> {
           },
         ],
         workOnCurrentBranch: false,
-        autoCreatePR: true,
+        autoCreatePR: false,
         skipReviewerRequest: true,
       },
-    });
+    };
+    assertLocalSdkBlocked(agentOptions);
+    await using agent = await Agent.create(agentOptions);
     console.log(`agent.id=${agent.agentId}`);
     const run = await agent.send(prompt, { mode: "agent" });
     console.log(`run.id=${run.id}`);
-    const waited = await waitForRun(run, "investigate");
-    result = waited.result;
+    const result = await waitForRun(run, "investigate");
     console.log(`run.id=${result.id} status=${result.status}`);
-    console.log(`run.git=${JSON.stringify(result.git ?? null)}`);
 
     if (result.status === "error") {
       console.error(`run failed: ${result.id}`);
@@ -1428,30 +899,6 @@ async function main(): Promise<void> {
     }
 
     outcome = parseOutcome(result.result ?? "");
-    persist = await snapshotCloudPersist(
-      agent,
-      result.id,
-      agent.agentId,
-      result.git,
-    );
-    persist = {
-      branches: persist.branches,
-      terraformFiles: mergeTerraformFiles([
-        ...waited.terraformFiles,
-        ...persist.terraformFiles,
-      ]),
-    };
-    if (
-      persist.branches.length === 0 &&
-      persist.terraformFiles.length === 0
-    ) {
-      persist = await waitForCloudPersist(
-        agent,
-        result.id,
-        agent.agentId,
-        result.git,
-      );
-    }
   } catch (error) {
     if (error instanceof CursorAgentError) {
       console.error(
@@ -1489,10 +936,10 @@ async function main(): Promise<void> {
 
   console.log(JSON.stringify(outcome, null, 2));
   if (outcome.outcome === "remediation") {
-    await openRemediationPullRequest(outcome, context, persist, prompt);
+    createRemediationPrFromWorkingTree(outcome, context);
     return;
   }
-  createNoCodeFixIssue(outcome, context, persist.branches);
+  createNoCodeFixIssue(outcome, context);
 }
 
 main().catch((error: unknown) => {
