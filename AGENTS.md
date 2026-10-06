@@ -15,15 +15,13 @@ Investigate a Terraform policy denial and produce the smallest compliant remedia
 - Do not change reusable module defaults unless that is clearly the intended scope.
 - Never invent identifiers, ARNs, key IDs, resource IDs, names, or other values that do not exist in the repository or provided inputs.
 - If a safe compliant fix requires information or an external value that is not available, do not guess. Return `no_code_fix` and identify what is missing.
-- After editing, you may run `terraform fmt` on files you change. Do not treat local checks as final verification. The GitHub Actions policy gate on the remediation pull request is authoritative.
-- When the platform provides a remediation branch/workspace, make changes only there.
-- Never push changes to the developer branch or `main`.
-- Do not create GitHub issues or post GitHub comments. Deterministic orchestration handles those operations.
-- Do not create additional branches or pull requests outside the platform-provided remediation flow.
+- Edit Terraform with Write or StrReplace. On a remediation, put the same full file text in `files`. `contents` is the complete file after the edit, not a unified diff.
+- You may run `terraform fmt` on files you change. The remediation pull request OPA check is the validation, not this turn.
+- `investigator.ts` is the sole publisher. `autoCreatePR` is off. Do not open branches, pull requests, issues, or comments, and do not push to the developer branch or `main`.
 
 ## Investigation result
 
 Return exactly one machine-readable outcome:
 
-- `remediation` when a safe compliant code change was made.
-- `no_code_fix` when a safe code change cannot be justified from the repository, policy, and provided inputs.
+- `remediation` when a safe compliant code change was made. Include `files` with `{ "path", "contents" }` for each changed `.tf` file.
+- `no_code_fix` when a safe code change cannot be justified from the repository, policy, and provided inputs. Omit `files`.

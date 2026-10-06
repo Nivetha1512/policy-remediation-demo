@@ -119,6 +119,12 @@ jobs:
       - name: Install investigator dependencies
         run: npm ci
 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+          terraform_wrapper: false
+
       - name: Invoke Cursor SDK investigator
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
