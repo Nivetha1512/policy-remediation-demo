@@ -35,13 +35,13 @@ jobs:
           opa version
 
       - name: Terraform fmt
-        run: terraform fmt -check -recursive
+        run: terraform -chdir=terraform fmt -check -recursive
 
       - name: Terraform init
-        run: terraform init -input=false
+        run: terraform -chdir=terraform init -input=false
 
       - name: Terraform validate
-        run: terraform validate
+        run: terraform -chdir=terraform validate
 
       - name: Terraform plan
         run: ./scripts/plan.sh
@@ -51,7 +51,6 @@ jobs:
         run: |
           set +e
           ./scripts/policy-check.sh
-          status=$?
           set -e
 
           if [[ ! -f artifacts/policy-result.json ]]; then

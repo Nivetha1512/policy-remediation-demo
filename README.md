@@ -31,6 +31,8 @@ The demo is plan-only and local. The AWS provider uses mock credentials and skip
 ./scripts/policy-check.sh
 ```
 
+`./scripts/plan.sh` runs `terraform init` and `terraform plan` with `-chdir=terraform` for `terraform/main.tf` and `terraform/modules/database`, and writes `artifacts/plan.json` and `artifacts/plan.tfplan` at the repository root. `./scripts/policy-check.sh` reads `artifacts/plan.json` and `policies/` from the repository root.
+
 The policy check is expected to fail before remediation.
 
 ## Reset the demo
@@ -39,12 +41,12 @@ The policy check is expected to fail before remediation.
 ./scripts/reset-demo.sh
 ```
 
-The reset script requires a clean working tree. It updates local `main` to `origin/main`, closes open demo pull requests, and removes existing demo and remediation branches. It then recreates and pushes:
+The reset script requires a clean working tree. It updates local `main` to `origin/main`, closes every open pull request and issue, and removes existing demo and remediation branches. It then recreates and pushes:
 
 - `demo/encryption-failure`
 - `demo/kms-failure`
 
-The encryption branch receives the Terraform caller fixture from `fixtures/encryption/`. The KMS branch receives the policy fixture from `fixtures/kms/`. The script returns to clean `main` when setup is complete.
+The encryption branch receives the Terraform caller fixture from `fixtures/encryption/`, copied onto `terraform/main.tf`. The KMS branch receives the policy fixture from `fixtures/kms/`, copied onto `policies/require-prod-kms.rego`. The script returns to clean `main` when setup is complete.
 
 ## Ask Cursor to investigate
 
@@ -54,11 +56,11 @@ Local checks are not the authoritative result. The GitHub Actions policy gate on
 
 ## GitHub Actions policy gate
 
-The `policy-check` job runs Terraform fmt, validate, and plan, then evaluates the same OPA policy. It does not apply infrastructure and does not use AWS credentials.
+The `policy-check` job runs Terraform fmt and validate with `-chdir=terraform`, then `./scripts/plan.sh` and `./scripts/policy-check.sh`. It does not apply infrastructure and does not use AWS credentials.
 
 A red `policy-check` on the broken caller is expected. That is the policy engine denying the plan.
 
-If and only if OPA returns a denial on an in-repository pull request, the `investigate` job starts a Cursor SDK cloud investigator from the pull-request head. Local `@cursor/sdk` execution on GitHub Actions crashes (exit 139), so CI never invokes `Agent.create` or `Agent.prompt` with a local runtime. Formatting, validation, plan, and dependency failures do not start the investigator. Heads named `cursor/*` and `policy-remediation/*` skip investigation so a remediation pull request is verified by OPA without recursively launching another investigator.
+If and only if OPA returns a denial on an in-repository pull request, the `investigate` job starts a Cursor SDK cloud investigator from the pull-request head. Local `@cursor/sdk` execution on GitHub Actions crashes (exit 139), so CI never starts a local runtime. Formatting, validation, plan, and dependency failures do not start the investigator. Heads named `cursor/*` and `policy-remediation/*` skip investigation so a remediation pull request is verified by OPA without recursively launching another investigator.
 
 The agent has no workflow GitHub token. `autoCreatePR` is off, so Cursor does not create a branch or pull request. The agent edits Terraform in its cloud workspace with Write or StrReplace and returns one JSON object. For a remediation, `files` carries the full text of each changed `.tf` file.
 
@@ -77,6 +79,22 @@ For a `no_code_fix` outcome, the script creates no remediation branch and no rem
 Create the key at [Cursor Dashboard → Integrations](https://cursor.com/dashboard/integrations) or in team service-account settings. Add it as a repository secret named `CURSOR_API_KEY`. Do not commit the value.
 
 GitHub's automatic `GITHUB_TOKEN` is used only after investigation to commit and push the remediation branch, open or retarget that pull request, or create and link a follow-up issue. Fork pull requests are skipped because an upstream remediation pull request cannot target a branch that exists only in a fork.
+
+## Cursor features this demo shows
+
+The KMS demo uses the same cloud investigator as the encryption demo, then stops because the missing key is not in the repo.
+
+Features the investigation uses:
+
+- **Cursor SDK cloud agent.** GitHub Actions calls `@cursor/sdk` `Agent.create` and `agent.send(..., { mode: "agent" })`. The runtime is a cloud agent. Local SDK execution stays blocked on GitHub Actions.
+- **A specific model.** The run requests `composer-2.5`.
+- **Repository-scoped cloud workspace.** `cloud.repos` points at this GitHub repo and `startingRef` is the failing pull request head, so the agent reads `demo/kms-failure` rather than `main`.
+- **Publish stays off.** `workOnCurrentBranch: false`, `autoCreatePR: false`, and `skipReviewerRequest: true`. The agent cannot open the remediation pull request. `investigator.ts` is the sole publisher. For KMS it creates one follow-up issue and one pull-request comment, and the original pull request stays blocked.
+- **Tool use without credentials.** The agent may edit with Write or StrReplace and may run `terraform fmt` on files under `terraform/`, such as `terraform/main.tf` and `terraform/modules/database`. Workflow GitHub tokens are removed before the run, so the agent cannot push, open a pull request, or file the issue.
+- **`AGENTS.md` as the binding instruction.** The agent must not invent a KMS key or weaken the deny rule. When the approved key is absent, it returns `no_code_fix` and names the missing input.
+- **A structured handoff.** The finished run returns one JSON object. `no_code_fix` has no `files` field. The script turns that into issue #19 and a comment on pull request #18.
+
+What this demo does not use: Cursor auto-creating a pull request, or Bugbot. `Agent.create()` runs for the denial investigation and returns `no_code_fix`. The script creates one follow-up issue and one comment on the original pull request, which stays blocked.
 
 ### Demo sequence
 

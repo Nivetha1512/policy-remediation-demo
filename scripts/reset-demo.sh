@@ -101,29 +101,34 @@ return_to_main() {
 }
 trap return_to_main EXIT
 
-while IFS=$'\t' read -r number branch; do
-  case "${branch}" in
-    "demo/encryption-failure" | \
-      "demo/kms-failure" | \
-      policy-remediation/*)
-      gh pr close "${number}" \
-        --repo "${EXPECTED_REPOSITORY}" \
-        --comment "Closing stale demo pull request during deterministic reset." \
-        >/dev/null 2>&1
-      ;;
-  esac
+while IFS= read -r number; do
+  [[ -n "${number}" ]] || continue
+  gh pr close "${number}" \
+    --repo "${EXPECTED_REPOSITORY}" \
+    --comment "Closing stale demo pull request during deterministic reset." \
+    >/dev/null 2>&1
 done < <(
   gh pr list \
     --repo "${EXPECTED_REPOSITORY}" \
     --state open \
     --limit 1000 \
-    --json headRefName,isCrossRepository,number \
-    --jq '
-      .[]
-      | select(.isCrossRepository == false)
-      | [.number, .headRefName]
-      | @tsv
-    '
+    --json isCrossRepository,number \
+    --jq '.[] | select(.isCrossRepository == false) | .number'
+)
+
+while IFS= read -r number; do
+  [[ -n "${number}" ]] || continue
+  gh issue close "${number}" \
+    --repo "${EXPECTED_REPOSITORY}" \
+    --comment "Closing stale demo issue during deterministic reset." \
+    >/dev/null 2>&1
+done < <(
+  gh issue list \
+    --repo "${EXPECTED_REPOSITORY}" \
+    --state open \
+    --limit 1000 \
+    --json number \
+    --jq '.[].number'
 )
 
 for branch in "${DEMO_BRANCHES[@]}"; do
@@ -154,10 +159,10 @@ done < <(
 )
 
 git switch --quiet --create "demo/encryption-failure" main
-cp fixtures/encryption/main.tf main.tf
-terraform fmt main.tf >/dev/null
-git add main.tf
-commit_fixture "Create encryption policy failure demo" main.tf
+cp fixtures/encryption/main.tf terraform/main.tf
+terraform -chdir=terraform fmt main.tf >/dev/null
+git add terraform/main.tf
+commit_fixture "Create encryption policy failure demo" terraform/main.tf
 git push --quiet --set-upstream origin "demo/encryption-failure"
 
 git switch --quiet main
@@ -175,6 +180,8 @@ trap - EXIT
 
 cat <<'EOF'
 Demo reset complete.
+
+Closed open pull requests and issues.
 
 Ready branches:
 - demo/encryption-failure
