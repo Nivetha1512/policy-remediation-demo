@@ -348,21 +348,8 @@ function buildPrompt(denies: string[]): string {
 
 function buildPersistPrompt(): string {
   return [
-    "The previous turn identified a safe Terraform remediation, but Cursor did not persist a named git branch or artifacts.",
-    "A JSON-only reply is not enough.",
-    "You must use file edit tools this turn before you answer:",
-    "1. Re-apply the same smallest compliant Terraform .tf source change with Write or StrReplace, even if you believe it is already saved.",
-    "2. Copy each changed .tf file into artifacts/<repository-relative-path> so orchestration can download it.",
-    "",
-    "Do not change the remediation, do not edit policy, and do not edit non-.tf files.",
-    "Do not invent a new fix or choose a different location.",
-    "Never invent identifiers, ARNs, key IDs, resource IDs, names, or other values that do not exist in the repository or provided inputs.",
-    "When the platform provides a remediation branch or workspace, make changes only there.",
-    "Never push changes to the developer branch or main.",
-    "Do not create GitHub issues or post GitHub comments. Deterministic orchestration handles those operations.",
-    "Do not create additional branches or pull requests outside the platform-provided remediation flow.",
-    "",
-    "After those tool calls, your final message must be the same JSON outcome object as before, with no Markdown fence.",
+    "Re-apply the same smallest compliant Terraform .tf source change with Write or StrReplace, even if you believe the edit is already saved.",
+    "Copy each changed .tf file into artifacts/<repository-relative-path> so orchestration can download it.",
   ].join("\n");
 }
 
